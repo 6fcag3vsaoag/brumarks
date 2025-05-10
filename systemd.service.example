@@ -1,0 +1,13 @@
+[Unit]
+Description=Telegram Student Rating Bot
+After=network.target
+
+[Service]
+User=pi
+WorkingDirectory=/home/pi/yourrepo
+Environment="PATH=/home/pi/yourrepo/venv/bin"
+ExecStart=/home/pi/yourrepo/venv/bin/python3 /home/pi/yourrepo/bot.py
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

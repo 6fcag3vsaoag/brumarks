@@ -1,2 +1,10 @@
 config.json
 students.db
+__pycache__
+*.pyc
+venv/
+*.db
+*.log
+.DS_Store
+*.swp
+config.json
