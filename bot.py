@@ -618,6 +618,27 @@ def format_ratings_table(name, data, is_group=False):
         table += "</pre>"
         return table
 
+def format_grade_changes_table(changes):
+    if not changes:
+        return "<pre>Нет изменений в рейтинге.</pre>"
+    table = "<pre>Изменения в рейтинге:\n"
+    table += "="*70 + "\n"
+    table += "Дисциплина".ljust(40) + " | Модуль | Было | Стало\n"
+    table += "-"*70 + "\n"
+    for subject, old_grade, new_grade in changes:
+        # subject: "Название (модуль X)"
+        if "(модуль" in subject:
+            disc, mod = subject.rsplit(' (модуль ', 1)
+            mod = mod.replace(")", "")
+        else:
+            disc, mod = subject, "?"
+        disc = disc[:37] + "..." if len(disc) > 40 else disc.ljust(40)
+        old = str(old_grade) if old_grade not in [None, "None"] else "-"
+        new = str(new_grade) if new_grade not in [None, "None"] else "-"
+        table += f"{disc} |  {mod.ljust(6)}| {old.rjust(5)} | {new.rjust(5)}\n"
+    table += "</pre>"
+    return table
+
 async def handle_message(update, context):
     text = update.message.text.strip()
     telegram_id = str(update.effective_user.id)
@@ -887,16 +908,23 @@ def check_grade_changes(student_id, new_grades):
         old_data = dict(zip(columns, row))
         
         changes = []
-        for subject, module in new_grades.items():
+        for subject in new_grades:
             if "(модуль" in subject:
                 old_grade = old_data.get(subject)
                 new_grade = new_grades[subject]
-                
-                if old_grade != new_grade and new_grade not in ["не изучает", None, "None"]:
+
+                # Приводим к строке для корректного сравнения
+                old_str = str(old_grade) if old_grade is not None else ""
+                new_str = str(new_grade) if new_grade is not None else ""
+
+                if old_str != new_str and new_str not in ["не изучает", "", "None"]:
                     changes.append((subject, old_grade, new_grade))
-                    log_grade_change(student_id, subject.split(' (модуль')[0], 
-                                  subject.split(' (модуль')[1].replace(')', ''), 
-                                  old_grade, new_grade)
+                    log_grade_change(
+                        student_id,
+                        subject.split(' (модуль')[0], 
+                        subject.split(' (модуль')[1].replace(')', ''), 
+                        old_grade, new_grade
+                    )
         
         return changes
     except Exception as e:
@@ -931,12 +959,10 @@ async def notify_grade_changes(application, student_id, changes):
             
         telegram_id, student_group = result
         
-        # Уведомляем студента об изменениях
-        message = "Есть изменения в рейтинге:\n"
-        for subject, old_grade, new_grade in changes:
-            message += f"{subject}: {old_grade} → {new_grade}\n"
-            
-        await application.bot.send_message(chat_id=telegram_id, text=message)
+        # Формируем красивую таблицу изменений
+        message = format_grade_changes_table(changes)
+        
+        await application.bot.send_message(chat_id=telegram_id, text=message, parse_mode='HTML')
         
         # Получаем всех одногруппников
         group_members = get_group_members(student_group)
