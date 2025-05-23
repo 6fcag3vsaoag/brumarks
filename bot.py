@@ -8,7 +8,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQu
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, BotCommand
 import uuid
 import re
-
+from telegram.error import NetworkError
 
 # Configure logging
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
@@ -201,16 +201,20 @@ async def check_registration(telegram_id):
         conn.close()
 
 async def start_command(update, context):
-    logger.info("Start command received")
+    telegram_id = str(update.effective_user.id)
+    log_event("start_command", telegram_id, message="User started bot")
+    
     await update.message.reply_text(
-        "Добро пожаловать! Выберите опцию:",
+        "Добро пожаловать! Я помогу вам следить за вашей успеваемостью.",
         reply_markup=INLINE_KEYBOARD_MARKUP
     )
 
 async def menu_command(update, context):
-    logger.info("Menu command received")
+    telegram_id = str(update.effective_user.id)
+    log_event("menu_command", telegram_id, message="User requested menu")
+    
     await update.message.reply_text(
-        "Выберите опцию:",
+        "Выберите действие:",
         reply_markup=INLINE_KEYBOARD_MARKUP
     )
 
@@ -265,8 +269,8 @@ async def handle_inline_buttons(update, context):
         logger.error("No callback_data received")
         return
 
-    logger.info(f"Inline button pressed: {callback_data}")
     telegram_id = str(update.effective_user.id)
+    log_event("button_click", telegram_id, message=f"Button clicked: {callback_data}")
 
     # Clear registration state before processing new command
     #context.user_data.clear()
@@ -616,14 +620,13 @@ def format_ratings_table(name, data, is_group=False):
 
 async def handle_message(update, context):
     text = update.message.text.strip()
-    logger.info(f"Received message: {text}")
+    telegram_id = str(update.effective_user.id)
+    log_event("message", telegram_id, message=text)
 
     if text == 'В начало':
         await handle_start_button(update, context)
         return
 
-    telegram_id = str(update.effective_user.id)
-    
     if context.user_data.get('awaiting_student_id'):
         student_id = text
         name, grades, subjects = parse_student_data(student_id)
@@ -757,8 +760,239 @@ def init_db():
         )
     ''')
     
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT,
+            event_type TEXT,
+            user_id TEXT,
+            student_id TEXT,
+            message TEXT,
+            data TEXT,
+            FOREIGN KEY (student_id) REFERENCES students(student_id)
+        )
+    ''')
+    
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS grade_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            student_id TEXT,
+            subject TEXT,
+            module TEXT,
+            old_grade TEXT,
+            new_grade TEXT,
+            timestamp TEXT,
+            FOREIGN KEY (student_id) REFERENCES students(student_id)
+        )
+    ''')
+    
     conn.commit()
     conn.close()
+
+def log_event(event_type, user_id=None, student_id=None, message=None, data=None):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute('''
+            INSERT INTO logs (timestamp, event_type, user_id, student_id, message, data)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (
+            datetime.datetime.now().isoformat(),
+            event_type,
+            user_id,
+            student_id,
+            message,
+            json.dumps(data) if data else None
+        ))
+        conn.commit()
+    except Exception as e:
+        logger.error(f"Error logging event: {e}")
+    finally:
+        conn.close()
+
+def log_grade_change(student_id, subject, module, old_grade, new_grade):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute('''
+            INSERT INTO grade_history (student_id, subject, module, old_grade, new_grade, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (
+            student_id,
+            subject,
+            module,
+            old_grade,
+            new_grade,
+            datetime.datetime.now().isoformat()
+        ))
+        conn.commit()
+    except Exception as e:
+        logger.error(f"Error logging grade change: {e}")
+    finally:
+        conn.close()
+
+def get_student_grade_history(student_id, subject=None, module=None):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        query = '''
+            SELECT * FROM grade_history 
+            WHERE student_id = ?
+        '''
+        params = [student_id]
+        
+        if subject:
+            query += ' AND subject = ?'
+            params.append(subject)
+        if module:
+            query += ' AND module = ?'
+            params.append(module)
+            
+        query += ' ORDER BY timestamp DESC'
+        
+        cursor.execute(query, params)
+        return cursor.fetchall()
+    except Exception as e:
+        logger.error(f"Error getting grade history: {e}")
+        return []
+    finally:
+        conn.close()
+
+def get_last_grade_change(student_id, subject, module):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute('''
+            SELECT * FROM grade_history 
+            WHERE student_id = ? AND subject = ? AND module = ?
+            ORDER BY timestamp DESC LIMIT 1
+        ''', (student_id, subject, module))
+        return cursor.fetchone()
+    except Exception as e:
+        logger.error(f"Error getting last grade change: {e}")
+        return None
+    finally:
+        conn.close()
+
+def check_grade_changes(student_id, new_grades):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT * FROM students WHERE student_id=?", (student_id,))
+        row = cursor.fetchone()
+        if not row:
+            return []
+            
+        columns = [desc[0] for desc in cursor.description]
+        old_data = dict(zip(columns, row))
+        
+        changes = []
+        for subject, module in new_grades.items():
+            if "(модуль" in subject:
+                old_grade = old_data.get(subject)
+                new_grade = new_grades[subject]
+                
+                if old_grade != new_grade and new_grade not in ["не изучает", None, "None"]:
+                    changes.append((subject, old_grade, new_grade))
+                    log_grade_change(student_id, subject.split(' (модуль')[0], 
+                                  subject.split(' (модуль')[1].replace(')', ''), 
+                                  old_grade, new_grade)
+        
+        return changes
+    except Exception as e:
+        logger.error(f"Error checking grade changes: {e}")
+        return []
+    finally:
+        conn.close()
+
+def get_group_members(student_group):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute('SELECT student_id, telegram_id FROM students WHERE student_group=?', (student_group,))
+        return cursor.fetchall()
+    except Exception as e:
+        logger.error(f"Error getting group members: {e}")
+        return []
+    finally:
+        conn.close()
+
+async def notify_grade_changes(application, student_id, changes):
+    if not changes:
+        return
+        
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute('SELECT telegram_id, student_group FROM students WHERE student_id=?', (student_id,))
+        result = cursor.fetchone()
+        if not result:
+            return
+            
+        telegram_id, student_group = result
+        
+        # Уведомляем студента об изменениях
+        message = "Есть изменения в рейтинге:\n"
+        for subject, old_grade, new_grade in changes:
+            message += f"{subject}: {old_grade} → {new_grade}\n"
+            
+        await application.bot.send_message(chat_id=telegram_id, text=message)
+        
+        # Получаем всех одногруппников
+        group_members = get_group_members(student_group)
+        for member_id, member_telegram_id in group_members:
+            if member_id != student_id and member_telegram_id != "added by admin":
+                await application.bot.send_message(
+                    chat_id=member_telegram_id,
+                    text=f"В группе {student_group} есть изменения в рейтинге. Используйте кнопку 'Мой Рейтинг' для просмотра."
+                )
+    except Exception as e:
+        logger.error(f"Error notifying grade changes: {e}")
+    finally:
+        conn.close()
+
+async def auto_parse_students(application):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        # Получаем всех студентов, у которых прошло более 4 часов с последнего парсинга
+        four_hours_ago = (datetime.datetime.now() - datetime.timedelta(hours=4)).isoformat()
+        cursor.execute('''
+            SELECT student_id, telegram_id, student_group 
+            FROM students 
+            WHERE last_parsed_time < ? OR last_parsed_time IS NULL
+        ''', (four_hours_ago,))
+        
+        students = cursor.fetchall()
+        for student_id, telegram_id, student_group in students:
+            try:
+                # Парсим данные студента
+                name, grades, subjects = parse_student_data(student_id)
+                if name == "Unknown":
+                    log_event("parse_error", telegram_id, student_id, "Failed to parse student data")
+                    continue
+                
+                # Проверяем изменения в оценках
+                changes = check_grade_changes(student_id, grades)
+                
+                # Сохраняем новые данные
+                save_to_db(student_id, name, grades, subjects, telegram_id, student_group)
+                
+                # Уведомляем об изменениях
+                if changes:
+                    await notify_grade_changes(application, student_id, changes)
+                    log_event("grade_changes", telegram_id, student_id, 
+                             f"Changes detected: {len(changes)} subjects", 
+                             {"changes": changes})
+                
+            except Exception as e:
+                logger.error(f"Error processing student {student_id}: {e}")
+                log_event("parse_error", telegram_id, student_id, str(e))
+                
+    except Exception as e:
+        logger.error(f"Error in auto_parse_students: {e}")
+    finally:
+        conn.close()
 
 async def set_bot_commands(application):
     commands = [
@@ -771,9 +1005,11 @@ async def set_bot_commands(application):
     except Exception as e:
         logger.error(f"Failed to set bot commands: {e}")
 
+async def error_handler(update, context):
+    logger.error(f"Exception: {context.error}")
+
 def main():
     init_db()
-    
     application = Application.builder().token(config["TOKEN"]).build()
 
     application.add_handler(CommandHandler("start", start_command))
@@ -782,6 +1018,11 @@ def main():
     application.add_handler(CallbackQueryHandler(handle_inline_buttons))
 
     application.job_queue.run_once(set_bot_commands, 0)
+    
+    # Запускаем автоматический парсинг каждые 4 часа
+    application.job_queue.run_repeating(auto_parse_students, interval=500, first=10)
+
+    application.add_error_handler(error_handler)
 
     logger.info("Starting bot polling")
     application.run_polling()
