@@ -1,2 +1,8 @@
 config.json
 students.db
+.idea/amplicode-jpa.xml
+.idea/brumarks.iml
+.idea/.gitignore
+.idea/misc.xml
+.idea/modules.xml
+.idea/vcs.xml
