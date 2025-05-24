@@ -27,6 +27,24 @@ async def handle_message(update, context):
     
     if context.user_data.get('awaiting_student_id'):
         student_id = text
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute('SELECT name, student_group FROM students WHERE student_id=?', (student_id,))
+        existing_student = cursor.fetchone()
+        if existing_student:
+            telegram_id = str(update.effective_user.id)
+            # Просто обновляем telegram_id в students и course_works
+            cursor.execute('UPDATE students SET telegram_id=? WHERE student_id=?', (telegram_id, student_id))
+            cursor.execute('UPDATE course_works SET telegram_id=? WHERE student_id=?', (telegram_id, student_id))
+            conn.commit()
+            conn.close()
+            context.user_data.clear()
+            await update.message.reply_text(
+                f"Ваш Telegram ID был успешно привязан к существующему студенту {existing_student[0]} (группа: {existing_student[1]}).",
+                reply_markup=REPLY_KEYBOARD_MARKUP
+            )
+            return
+        conn.close()
         context.user_data['temp_student_id'] = student_id
         context.user_data['awaiting_student_id'] = False
         context.user_data['awaiting_group'] = True
@@ -49,6 +67,24 @@ async def handle_message(update, context):
     if context.user_data.get('awaiting_group'):
         student_group = text.upper()
         student_id = context.user_data.get('temp_student_id')
+        telegram_id = str(update.effective_user.id)
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        # Проверяем, есть ли студент с таким student_id
+        cursor.execute('SELECT name FROM students WHERE student_id=?', (student_id,))
+        existing_student = cursor.fetchone()
+        if existing_student:
+            # Просто обновляем telegram_id в students и course_works
+            cursor.execute('UPDATE students SET telegram_id=? WHERE student_id=?', (telegram_id, student_id))
+            cursor.execute('UPDATE course_works SET telegram_id=? WHERE student_id=?', (telegram_id, student_id))
+            conn.commit()
+            conn.close()
+            context.user_data.clear()
+            await update.message.reply_text(
+                f"Ваш Telegram ID был успешно привязан к существующему студенту {existing_student[0]}.",
+                reply_markup=REPLY_KEYBOARD_MARKUP
+            )
+            return
         # Сообщаем пользователю о начале процесса
         if not context.user_data.get('registration_in_progress'):
             context.user_data['registration_in_progress'] = True
