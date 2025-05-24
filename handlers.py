@@ -268,6 +268,82 @@ async def handle_message(update, context):
             context.user_data.clear()
         return
 
+    if context.user_data.get('awaiting_superadmin_student_id'):
+        student_id = update.message.text.strip()
+        context.user_data['temp_superadmin_student_id'] = student_id
+        context.user_data['awaiting_superadmin_student_id'] = False
+        context.user_data['awaiting_superadmin_group'] = True
+        # Получаем список уникальных групп
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute('SELECT DISTINCT student_group FROM students WHERE student_group IS NOT NULL AND student_group != ""')
+        groups = [row[0] for row in cursor.fetchall() if row[0]]
+        conn.close()
+        group_keyboard = [[g] for g in sorted(groups)] if groups else []
+        from telegram import ReplyKeyboardMarkup
+        reply_markup = ReplyKeyboardMarkup(group_keyboard, resize_keyboard=True, one_time_keyboard=True) if group_keyboard else CANCEL_KEYBOARD_MARKUP
+        await update.message.reply_text(
+            "Введите группу БОЛЬШИМИ РУССКИМИ БУКВАМИ, например ПМР-231, либо выберите из уже существующих:",
+            reply_markup=reply_markup
+        )
+        return
+    if context.user_data.get('awaiting_superadmin_group'):
+        student_group = update.message.text.strip().upper()
+        student_id = context.user_data.get('temp_superadmin_student_id')
+        # Парсим только если еще не парсили для этого студента в этой сессии
+        if 'temp_superadmin_parsed_student_id' in context.user_data and context.user_data['temp_superadmin_parsed_student_id'] == student_id:
+            name = context.user_data['temp_superadmin_name']
+            grades = context.user_data['temp_superadmin_grades']
+            subjects = context.user_data['temp_superadmin_subjects']
+            course_works = context.user_data['temp_superadmin_course_works']
+        else:
+            name, grades, subjects, course_works = parse_student_data(student_id)
+            context.user_data['temp_superadmin_name'] = name
+            context.user_data['temp_superadmin_grades'] = grades
+            context.user_data['temp_superadmin_subjects'] = subjects
+            context.user_data['temp_superadmin_course_works'] = course_works
+            context.user_data['temp_superadmin_parsed_student_id'] = student_id
+        if name == "Unknown":
+            await update.message.reply_text(
+                "Не удалось получить данные по номеру студенческого билета. Проверьте правильность номера или сервер VUZ2 не отвечает. Попробуйте позже.\n\nВы можете отменить действие командой /cancel.",
+                reply_markup=CANCEL_KEYBOARD_MARKUP
+            )
+            context.user_data.clear()
+            return
+        try:
+            save_to_db(
+                student_id=student_id,
+                name=name,
+                grades=grades,
+                subjects=subjects,
+                telegram_id="added_by_superadmin",
+                student_group=student_group,
+                is_admin=False
+            )
+            for cw in course_works:
+                from utils import save_course_work_to_db
+                save_course_work_to_db(
+                    student_id=student_id,
+                    name=name,
+                    telegram_id="added_by_superadmin",
+                    student_group=student_group,
+                    discipline=cw.get('discipline'),
+                    file_path=cw.get('file_path'),
+                    semester=cw.get('semester')
+                )
+            await update.message.reply_text(
+                f"Пользователь {name} успешно добавлен в группу {student_group}.",
+                reply_markup=REPLY_KEYBOARD_MARKUP
+            )
+        except Exception as e:
+            logger.error(f"Ошибка при добавлении пользователя суперадмином: {e}")
+            await update.message.reply_text(
+                "Произошла ошибка при добавлении пользователя.",
+                reply_markup=REPLY_KEYBOARD_MARKUP
+            )
+        context.user_data.clear()
+        return
+
     await update.message.reply_text(
         "Пожалуйста, используйте кнопки меню.\n\nВы можете вернуться в главное меню командой /cancel.",
         reply_markup=REPLY_KEYBOARD_MARKUP
@@ -288,8 +364,22 @@ async def handle_inline_buttons(update, context):
     logger.info(f"Inline button pressed: {callback_data}")
     telegram_id = str(update.effective_user.id)
 
-    is_registered, student_data = await check_registration(telegram_id)
-    student_id, student_group, is_admin = student_data if student_data else (None, None, False)
+    # --- Вытаскиваем is_superadmin ---
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute('SELECT student_id, student_group, is_admin, is_superadmin FROM students WHERE telegram_id=?', (telegram_id,))
+        student_row = cursor.fetchone()
+        if student_row:
+            student_id, student_group, is_admin, is_superadmin = student_row
+        else:
+            student_id, student_group, is_admin, is_superadmin = None, None, 0, 0
+    except Exception as e:
+        logger.error(f"Ошибка при получении профиля: {e}")
+        student_id, student_group, is_admin, is_superadmin = None, None, 0, 0
+    finally:
+        conn.close()
+    is_registered = student_id is not None
 
     if not is_registered:
         await update.callback_query.message.reply_text(
@@ -489,10 +579,25 @@ async def handle_inline_buttons(update, context):
         keyboard = []
         if is_admin:
             keyboard.append([InlineKeyboardButton("Добавить админа", callback_data='add_admin')])
+        if is_superadmin:
+            keyboard.append([InlineKeyboardButton("Добавить пользователя другой группы", callback_data='add_other_group_user')])
         await query.message.reply_text(
             "Настройки:",
             reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else REPLY_KEYBOARD_MARKUP
         )
+
+    elif callback_data == 'add_other_group_user':
+        if not is_superadmin:
+            await query.message.reply_text(
+                "Только суперадминистратор может добавлять пользователей в другие группы.",
+                reply_markup=REPLY_KEYBOARD_MARKUP
+            )
+            return
+        await query.message.reply_text(
+            "Введите номер студенческого билета пользователя, которого хотите добавить в любую группу:\n\nВы можете отменить действие командой /cancel.",
+            reply_markup=CANCEL_KEYBOARD_MARKUP
+        )
+        context.user_data['awaiting_superadmin_student_id'] = True
 
     elif callback_data == 'add_admin':
         if not is_registered or not is_admin:
