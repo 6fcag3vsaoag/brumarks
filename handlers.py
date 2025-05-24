@@ -581,7 +581,26 @@ async def handle_inline_buttons(update, context):
                     }
                     group_data.append((name, grades))
                 message = format_ratings_table(discipline_name, group_data, is_group=True)
-                await query.message.reply_text(message, parse_mode='HTML', reply_markup=REPLY_KEYBOARD_MARKUP)
+
+                # Проверяем наличие курсовых работ по дисциплине
+                cursor.execute('SELECT COUNT(*) FROM course_works WHERE discipline=? AND student_group=?', (discipline_name, student_group))
+                cw_count = cursor.fetchone()[0]
+                if cw_count > 0:
+                    # Добавляем кнопку "Курсовые работы"
+                    keyboard = [
+                        [InlineKeyboardButton("Курсовые работы", callback_data=f"courseworks_{discipline_key}")]
+                    ]
+                    await query.message.reply_text(
+                        message,
+                        parse_mode='HTML',
+                        reply_markup=InlineKeyboardMarkup(keyboard)
+                    )
+                else:
+                    await query.message.reply_text(
+                        message,
+                        parse_mode='HTML',
+                        reply_markup=REPLY_KEYBOARD_MARKUP
+                    )
             except Exception as e:
                 logger.error(f"Error displaying discipline ratings: {e}")
                 await query.message.reply_text("Произошла ошибка при получении данных.\n\nВы можете вернуться в главное меню командой /cancel.")
@@ -591,10 +610,75 @@ async def handle_inline_buttons(update, context):
         except Exception as inner_error:
             logger.error(f"Unexpected error in discipline handler: {inner_error}")
 
-    elif callback_data.startswith('student_'):
-        student_id = callback_data.split('_')[1]
-        await show_student_rating(query, student_id)
+    elif callback_data.startswith('courseworks_'):
+        # Показываем список курсовых работ по дисциплине
+        discipline_key = callback_data[len('courseworks_'):]
+        discipline_name = context.user_data.get('discipline_map', {}).get(discipline_key)
+        if not discipline_name:
+            await query.message.reply_text(
+                "Ошибка: дисциплина не найдена. Попробуйте снова.",
+                reply_markup=REPLY_KEYBOARD_MARKUP
+            )
+            return
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute('SELECT student_group FROM students WHERE telegram_id=?', (telegram_id,))
+            result = cursor.fetchone()
+            if not result:
+                await query.message.reply_text(
+                    "Группа не найдена. Пожалуйста, зарегистрируйтесь заново.",
+                    reply_markup=REPLY_KEYBOARD_MARKUP
+                )
+                return
+            student_group = result[0]
+            cursor.execute('SELECT name, discipline, file_path, semester FROM course_works WHERE discipline=? AND student_group=?', (discipline_name, student_group))
+            course_works = cursor.fetchall()
+            if not course_works:
+                await query.message.reply_text(
+                    "Курсовые работы по этой дисциплине не найдены.",
+                    reply_markup=REPLY_KEYBOARD_MARKUP
+                )
+                return
+            # Формируем список работ
+            msg = f"<b>Курсовые работы по дисциплине {discipline_name}:</b>\n"
+            buttons = []
+            for idx, (name, discipline, file_path, semester) in enumerate(course_works, 1):
+                filename = file_path.split('/')[-1]
+                msg += f"{idx}. {name} ({student_group}), {discipline}, семестр {semester}\n"
+                buttons.append([InlineKeyboardButton(f"{name} - {filename}", callback_data=f"getcw_{file_path}")])
+            # Кнопка для скачивания всех работ архивом (реализация архивации потребуется отдельно)
+            buttons.append([InlineKeyboardButton("Скачать все архивом", callback_data=f"getcwzip_{discipline_key}")])
+            await query.message.reply_text(
+                msg,
+                parse_mode='HTML',
+                reply_markup=InlineKeyboardMarkup(buttons)
+            )
+        except Exception as e:
+            logger.error(f"Ошибка при получении курсовых работ: {e}")
+            await query.message.reply_text(
+                "Произошла ошибка при получении курсовых работ.",
+                reply_markup=REPLY_KEYBOARD_MARKUP
+            )
+        finally:
+            conn.close()
+    elif callback_data.startswith('getcw_'):
+        # Заглушка: отправка отдельной курсовой работы
+        file_path = callback_data[len('getcw_'):]
+        # TODO: реализовать отправку файла пользователю
+        await query.message.reply_text(
+            f"Файл: {file_path} (отправка файла будет реализована)",
+            reply_markup=REPLY_KEYBOARD_MARKUP
+        )
 
+    elif callback_data.startswith('getcwzip_'):
+        # Заглушка: отправка архива всех курсовых работ по дисциплине
+        discipline_key = callback_data[len('getcwzip_'):]
+        # TODO: реализовать сбор и отправку архива
+        await query.message.reply_text(
+            f"Архив курсовых работ по дисциплине {discipline_key} (отправка архива будет реализована)",
+            reply_markup=REPLY_KEYBOARD_MARKUP
+        )
     elif callback_data == 'settings':
         # Получаем подробную информацию о пользователе
         conn = get_db_connection()
@@ -641,7 +725,6 @@ async def handle_inline_buttons(update, context):
                 reply_markup=InlineKeyboardMarkup(keyboard)
             )
         return
-
     elif callback_data == 'add_other_group_user':
         if not is_superadmin:
             await query.message.reply_text(
@@ -654,7 +737,7 @@ async def handle_inline_buttons(update, context):
             reply_markup=CANCEL_KEYBOARD_MARKUP
         )
         context.user_data['awaiting_superadmin_student_id'] = True
-
+        return
     elif callback_data == 'add_admin':
         if not is_registered or not is_admin:
             await query.message.reply_text(
@@ -667,6 +750,7 @@ async def handle_inline_buttons(update, context):
             reply_markup=CANCEL_KEYBOARD_MARKUP
         )
         context.user_data['awaiting_add_admin_id'] = True
+        return
     elif callback_data == 'add_student':
         if not is_admin:
             await query.message.reply_text(
@@ -679,10 +763,14 @@ async def handle_inline_buttons(update, context):
             reply_markup=CANCEL_KEYBOARD_MARKUP
         )
         context.user_data['awaiting_add_student_id'] = True
+        return
+    elif callback_data.startswith('student_'):
+        student_id = callback_data.split('_')[1]
+        await show_student_rating(query, student_id)
+        return
 
-    elif callback_data == 'cancel_registration':
-        context.user_data.clear()
-        await query.message.reply_text(
-            "Действие отменено. Вы вернулись в главное меню! Выберите опцию:",
-            reply_markup=INLINE_KEYBOARD_MARKUP
-        )
+    # Обработка других кнопок
+    await query.message.reply_text(
+        "Пожалуйста, используйте кнопки меню.\n\nВы можете вернуться в главное меню командой /cancel.",
+        reply_markup=REPLY_KEYBOARD_MARKUP
+    )
