@@ -1,5 +1,6 @@
 import sqlite3
 import requests
+import os
 from bs4 import BeautifulSoup
 import datetime
 import json
@@ -16,7 +17,7 @@ console_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - 
 console_handler.setFormatter(console_formatter)
 
 file_handler = logging.FileHandler('bot.log', encoding='utf-8')
-file_handler.setLevel(logging.WARNING)
+file_handler.setLevel(logging.INFO)
 file_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 file_handler.setFormatter(file_formatter)
 
@@ -48,6 +49,11 @@ REPLY_KEYBOARD_MARKUP = ReplyKeyboardMarkup(REPLY_KEYBOARD, resize_keyboard=True
 
 CANCEL_KEYBOARD = [[InlineKeyboardButton("Отмена", callback_data='cancel_registration')]]
 CANCEL_KEYBOARD_MARKUP = InlineKeyboardMarkup(CANCEL_KEYBOARD)
+
+# Directory for course work files
+COURSE_WORKS_DIR = 'course_works'
+if not os.path.exists(COURSE_WORKS_DIR):
+    os.makedirs(COURSE_WORKS_DIR)
 
 # Database functions
 def get_db_connection():
@@ -108,7 +114,47 @@ def get_subjects(soup):
     headers = [header.text.strip() for header in rows[0].find_all('th')]
     return headers[1:-1] if len(headers) > 2 else []
 
-def parse_student_data(student_id):
+def download_course_work_file(url, student_id, semester):
+    """
+    Download a course work file and save it to the course_works directory.
+    Returns the local file path or None if download fails.
+    """
+    try:
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        original_filename = os.path.basename(url)
+        # Create a unique filename to avoid conflicts
+        base, ext = os.path.splitext(original_filename)
+        unique_filename = f"{base}{ext}"
+        file_path = os.path.join(COURSE_WORKS_DIR, unique_filename)
+        with open(file_path, 'wb') as f:
+            f.write(response.content)
+        logger.info(f"Downloaded course work file: {file_path}")
+        return file_path
+    except Exception as e:
+        logger.error(f"Error downloading course work file from {url}: {e}")
+        return None
+
+def save_course_work_to_db(student_id, name, telegram_id, student_group, discipline, file_path, semester):
+    """
+    Save course work details to the course_works table.
+    """
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        parsing_time = datetime.datetime.now().isoformat()
+        cursor.execute('''
+            INSERT INTO course_works (discipline, student_id, telegram_id, name, student_group, semester, file_path, parsing_time)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (discipline, student_id, telegram_id, name, student_group, semester, file_path, parsing_time))
+        conn.commit()
+        logger.info(f"Saved course work for student_id {student_id}, discipline {discipline}")
+
+def parse_student_data(student_id, telegram_id=None, student_group=None):
+    """
+    Parse student data and course works from VUZ2 website.
+    Returns: (name, grades, subjects, course_works)
+    """
+    # Parse student performance data
     url = f"http://vuz2.bru.by/rate/{student_id}/"
     try:
         response = requests.get(url, timeout=10)
@@ -123,23 +169,68 @@ def parse_student_data(student_id):
         last_name = full_name.split()[0] if full_name != "Unknown" and len(full_name.split()) > 0 else "Unknown"
         subjects = get_subjects(soup)
         if not subjects:
-            return last_name, {}, subjects
-        table = soup.find('table', id='user')
-        rows = table.find_all('tr')
-        grades = {}
-        module_map = {'1-ый модуль': '1', '2-ой модуль': '2'}
-        for module_label, module_num in module_map.items():
-            module_row = next((row for row in rows if row.find('td') and row.find('td').text.strip() == module_label), None)
-            if module_row:
-                module_cells = module_row.find_all('td')
-                if len(module_cells) > 1:
-                    for i, subject in enumerate(subjects):
-                        grade = module_cells[i + 1].text.strip() if i + 1 < len(module_cells) else '-'
-                        grades[f"{subject} (модуль {module_num})"] = int(grade) if grade.isdigit() else None
-        return last_name, grades, subjects
+            grades = {}
+        else:
+            table = soup.find('table', id='user')
+            rows = table.find_all('tr')
+            grades = {}
+            module_map = {'1-ый модуль': '1', '2-ой модуль': '2'}
+            for module_label, module_num in module_map.items():
+                module_row = next((row for row in rows if row.find('td') and row.find('td').text.strip() == module_label), None)
+                if module_row:
+                    module_cells = module_row.find_all('td')
+                    if len(module_cells) > 1:
+                        for i, subject in enumerate(subjects):
+                            grade = module_cells[i + 1].text.strip() if i + 1 < len(module_cells) else '-'
+                            grades[f"{subject} (модуль {module_num})"] = int(grade) if grade.isdigit() else None
     except Exception as e:
         logger.error(f"Ошибка при парсинге данных студента для ID {student_id}: {e}")
-        return "Unknown", {}, []
+        return "Unknown", {}, [], []
+
+    # Parse course work data
+    course_works = []
+    portfolio_url = f"http://vuz2.bru.by/rate/{student_id}/portfolio/1/"
+    try:
+        response = requests.get(portfolio_url, timeout=10)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.content, 'html.parser', from_encoding='utf-8')
+        portfolio_section = soup.find('div', class_='box data')
+        if portfolio_section:
+            ul = portfolio_section.find('ul')
+            if ul:
+                for li in ul.find_all('li'):
+                    text = li.text.strip()
+                    semester_match = re.search(r'Семестр: (\d+)', text)
+                    discipline_match = re.search(r'Дисциплина: ([^\<]+?)(?=\s*\<a|$)', text)
+                    if semester_match and discipline_match:
+                        semester = semester_match.group(1)
+                        discipline = discipline_match.group(1).strip()
+                        file_link = li.find('a')
+                        if file_link and 'href' in file_link.attrs:
+                            file_url = file_link['href']
+                            if not file_url.startswith('http'):
+                                file_url = f"http://vuz2.bru.by{file_url}"
+                            file_path = download_course_work_file(file_url, student_id, semester)
+                            if file_path:
+                                course_works.append({
+                                    'discipline': discipline,
+                                    'semester': semester,
+                                    'file_path': file_path
+                                })
+                                # Save to course_works table
+                                save_course_work_to_db(
+                                    student_id=student_id,
+                                    name=full_name,
+                                    telegram_id=telegram_id or "added by admin",
+                                    student_group=student_group,
+                                    discipline=discipline,
+                                    file_path=file_path,
+                                    semester=semester
+                                )
+    except Exception as e:
+        logger.error(f"Ошибка при парсинге курсовых работ для ID {student_id}: {e}")
+
+    return last_name, grades, subjects, course_works
 
 def save_to_db(student_id, name, grades, subjects, telegram_id=None, student_group=None, is_admin=False):
     with get_db_connection() as conn:

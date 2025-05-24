@@ -6,3 +6,8 @@ students.db
 .idea/misc.xml
 .idea/modules.xml
 .idea/vcs.xml
+course_works/
+__pycache__/
+bot.log
+__pycache__/handlers.*
+__pycache__/utils.*

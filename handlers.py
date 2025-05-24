@@ -96,7 +96,7 @@ async def handle_message(update, context):
             student_data = cursor.fetchone()
             
             if not student_data:
-                name, grades, subjects = parse_student_data(student_id)
+                name, grades, subjects, course_works = parse_student_data(student_id, telegram_id="added by admin", student_group=admin_group)
                 if name == "Unknown":
                     await update.message.reply_text(
                         "Не удалось получить данные по номеру студенческого билета. Проверьте правильность введенного номера. Возможно сервер VUZ2 не отвечает. Попробуйте позже.\n\nВы можете отменить действие командой /cancel.",

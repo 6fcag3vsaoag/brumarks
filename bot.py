@@ -47,6 +47,7 @@ def init_db():
                 telegram_id TEXT,
                 name TEXT,
                 student_group TEXT,
+                semester INTEGER,
                 file_path TEXT,
                 parsing_time TEXT
             )
