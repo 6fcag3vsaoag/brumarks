@@ -159,6 +159,115 @@ async def handle_message(update, context):
             context.user_data.clear()
         return
 
+    if context.user_data.get('awaiting_add_admin_id'):
+        student_id = text
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute('SELECT student_group, is_admin FROM students WHERE telegram_id=?', (telegram_id,))
+            admin_data = cursor.fetchone()
+            if not admin_data or not admin_data[1]:
+                await update.message.reply_text(
+                    "Только администратор группы может выполнять это действие.",
+                    reply_markup=REPLY_KEYBOARD_MARKUP
+                )
+                context.user_data.clear()
+                return
+            admin_group = admin_data[0]
+            cursor.execute('SELECT name, student_group, is_admin FROM students WHERE student_id=?', (student_id,))
+            student_data = cursor.fetchone()
+            if not student_data:
+                name, grades, subjects, course_works = parse_student_data(student_id, telegram_id="added by admin", student_group=admin_group)
+                if name == "Unknown":
+                    await update.message.reply_text(
+                        "Не удалось получить данные по номеру студенческого билета. Проверьте правильность введенного номера. Возможно сервер VUZ2 не отвечает. Попробуйте позже.\n\nВы можете отменить действие командой /cancel.",
+                        reply_markup=CANCEL_KEYBOARD_MARKUP
+                    )
+                    context.user_data.clear()
+                    return
+                save_to_db(student_id, name, grades, subjects, telegram_id="added by admin", student_group=admin_group, is_admin=True)
+                await update.message.reply_text(
+                    f"Пользователь {name} добавлен как администратор группы {admin_group}!",
+                    reply_markup=REPLY_KEYBOARD_MARKUP
+                )
+            else:
+                name, student_group, is_admin_flag = student_data
+                if student_group != admin_group:
+                    await update.message.reply_text(
+                        f"Пользователь {name} находится в другой группе ({student_group}).",
+                        reply_markup=REPLY_KEYBOARD_MARKUP
+                    )
+                elif is_admin_flag:
+                    await update.message.reply_text(
+                        f"Пользователь {name} уже является администратором группы {admin_group}.",
+                        reply_markup=REPLY_KEYBOARD_MARKUP
+                    )
+                else:
+                    cursor.execute('UPDATE students SET is_admin=1 WHERE student_id=?', (student_id,))
+                    conn.commit()
+                    await update.message.reply_text(
+                        f"Пользователь {name} назначен администратором группы {admin_group}.",
+                        reply_markup=REPLY_KEYBOARD_MARKUP
+                    )
+        except Exception as e:
+            logger.error(f"Error processing add admin action: {e}")
+            await update.message.reply_text("Произошла ошибка при выполнении действия.\n\nВы можете вернуться в главное меню командой /cancel.")
+        finally:
+            conn.close()
+            context.user_data.clear()
+        return
+
+    if context.user_data.get('awaiting_add_student_id'):
+        student_id = text
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute('SELECT student_group, is_admin FROM students WHERE telegram_id=?', (telegram_id,))
+            admin_data = cursor.fetchone()
+            if not admin_data or not admin_data[1]:
+                await update.message.reply_text(
+                    "Только администратор группы может выполнять это действие.",
+                    reply_markup=REPLY_KEYBOARD_MARKUP
+                )
+                context.user_data.clear()
+                return
+            admin_group = admin_data[0]
+            cursor.execute('SELECT name, student_group FROM students WHERE student_id=?', (student_id,))
+            student_data = cursor.fetchone()
+            if not student_data:
+                name, grades, subjects, course_works = parse_student_data(student_id, telegram_id="added by admin", student_group=admin_group)
+                if name == "Unknown":
+                    await update.message.reply_text(
+                        "Не удалось получить данные по номеру студенческого билета. Проверьте правильность введенного номера. Возможно сервер VUZ2 не отвечает. Попробуйте позже.\n\nВы можете отменить действие командой /cancel.",
+                        reply_markup=CANCEL_KEYBOARD_MARKUP
+                    )
+                    context.user_data.clear()
+                    return
+                save_to_db(student_id, name, grades, subjects, telegram_id="added by admin", student_group=admin_group)
+                await update.message.reply_text(
+                    f"Студент {name} добавлен в группу {admin_group}!",
+                    reply_markup=REPLY_KEYBOARD_MARKUP
+                )
+            else:
+                name, student_group = student_data
+                if student_group != admin_group:
+                    await update.message.reply_text(
+                        f"Студент {name} находится в другой группе ({student_group}).",
+                        reply_markup=REPLY_KEYBOARD_MARKUP
+                    )
+                else:
+                    await update.message.reply_text(
+                        f"Студент {name} уже является членом группы {admin_group}.",
+                        reply_markup=REPLY_KEYBOARD_MARKUP
+                    )
+        except Exception as e:
+            logger.error(f"Error processing add student action: {e}")
+            await update.message.reply_text("Произошла ошибка при выполнении действия.\n\nВы можете вернуться в главное меню командой /cancel.")
+        finally:
+            conn.close()
+            context.user_data.clear()
+        return
+
     await update.message.reply_text(
         "Пожалуйста, используйте кнопки меню.\n\nВы можете вернуться в главное меню командой /cancel.",
         reply_markup=REPLY_KEYBOARD_MARKUP
@@ -396,8 +505,7 @@ async def handle_inline_buttons(update, context):
             "Введите номер студенческого билета нового администратора:\n\nВы можете отменить действие командой /cancel.",
             reply_markup=CANCEL_KEYBOARD_MARKUP
         )
-        context.user_data['awaiting_admin_student_id'] = True
-
+        context.user_data['awaiting_add_admin_id'] = True
     elif callback_data == 'add_student':
         if not is_admin:
             await query.message.reply_text(
@@ -409,7 +517,7 @@ async def handle_inline_buttons(update, context):
             "Введите номер студенческого билета:\n\nВы можете отменить действие командой /cancel.",
             reply_markup=CANCEL_KEYBOARD_MARKUP
         )
-        context.user_data['awaiting_admin_student_id'] = True
+        context.user_data['awaiting_add_student_id'] = True
 
     elif callback_data == 'cancel_registration':
         context.user_data.clear()
