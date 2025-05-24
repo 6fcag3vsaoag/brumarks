@@ -199,16 +199,18 @@ def parse_student_data(student_id, telegram_id=None, student_group=None):
             ul = portfolio_section.find('ul')
             if ul:
                 for li in ul.find_all('li'):
-                    text = li.text.strip()
-                    semester_match = re.search(r'Семестр: (\d+)', text)
-                    discipline_match = re.search(r'Дисциплина: ([^\<]+?)(?=\s*\<a|$)', text)
+                    # Получаем текст до первого <a> (только описание, без имени файла)
+                    li_text = ''
+                    for content in li.contents:
+                        if getattr(content, 'name', None) == 'a':
+                            break
+                        if isinstance(content, str):
+                            li_text += content
+                    semester_match = re.search(r'Семестр: (\d+)', li_text)
+                    discipline_match = re.search(r'Дисциплина: (.*)', li_text)
                     if semester_match and discipline_match:
                         semester = semester_match.group(1)
-                        discipline_raw = discipline_match.group(1).strip()
-                        # Оставляем только название дисциплины (до первой точки или до первой цифры, если есть)
-                        discipline = discipline_raw.split('(')[0].strip()
-                        # Если в названии есть файл, убираем его
-                        discipline = re.split(r'\s+[A-Za-zА-Яа-я0-9_.-]+\.(zip|pdf|rar|7z)', discipline)[0].strip()
+                        discipline = discipline_match.group(1).strip()
                         file_link = li.find('a')
                         if file_link and 'href' in file_link.attrs:
                             file_url = file_link['href']

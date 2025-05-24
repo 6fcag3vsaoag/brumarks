@@ -364,10 +364,8 @@ async def handle_message(update, context):
         context.user_data.clear()
         return
 
-    await update.message.reply_text(
-        "Пожалуйста, используйте кнопки меню.\n\nВы можете вернуться в главное меню командой /cancel.",
-        reply_markup=REPLY_KEYBOARD_MARKUP
-    )
+    # Убираем универсальное сообщение 'Пожалуйста, используйте кнопки меню...'
+    return
 
 async def handle_inline_buttons(update, context):
     query = update.callback_query
@@ -490,35 +488,14 @@ async def handle_inline_buttons(update, context):
                     reply_markup=REPLY_KEYBOARD_MARKUP
                 )
                 return
-            sanitized_disciplines = []
-            for disc in sorted(disciplines):
-                safe_disc = re.sub(r'[^\w\s-]', '', disc).strip()
-                safe_disc = re.sub(r'\s+', '_', safe_disc)
-                callback_data = f"discipline_{safe_disc}"
-                encoded = callback_data.encode('utf-8')
-                while len(encoded) > 63 and len(safe_disc) > 5:
-                    safe_disc = safe_disc[:-1]
-                    callback_data = f"discipline_{safe_disc}"
-                    encoded = callback_data.encode('utf-8')
-                if safe_disc and len(encoded) <= 64:
-                    sanitized_disciplines.append((disc, safe_disc))
-                    logger.info(f"Discipline: {disc} -> Sanitized: {safe_disc}, bytes: {len(encoded)}")
-                else:
-                    logger.warning(f"Пропущена дисциплина: {disc} (слишком длинное имя)")
-            if not sanitized_disciplines:
-                await query.message.reply_text(
-                    "Не удалось загрузить дисциплины. Проверьте их названия.",
-                    reply_markup=REPLY_KEYBOARD_MARKUP
-                )
-                return
-            context.user_data.pop('discipline_map', None)
-            context.user_data['discipline_map'] = {
-                f"discipline_{safe_disc}": disc for disc, safe_disc in sanitized_disciplines
-            }
-            keyboard = [
-                [InlineKeyboardButton(disc, callback_data=f"discipline_{safe_disc}")]
-                for disc, safe_disc in sanitized_disciplines
-            ]
+            # Use short keys for callback_data
+            discipline_map = {}
+            keyboard = []
+            for idx, disc in enumerate(sorted(disciplines)):
+                key = f"d{idx}"
+                discipline_map[key] = disc
+                keyboard.append([InlineKeyboardButton(disc, callback_data=f"discipline_{key}")])
+            context.user_data['discipline_map'] = discipline_map
             await query.message.reply_text(
                 "Ваши дисциплины:",
                 reply_markup=InlineKeyboardMarkup(keyboard)
@@ -537,7 +514,7 @@ async def handle_inline_buttons(update, context):
             )
             return
         try:
-            discipline_key = callback_data
+            discipline_key = callback_data[len('discipline_'):]
             logger.info(f"Получен callback: {discipline_key}")
             logger.info(f"Текущий discipline_map: {context.user_data.get('discipline_map', {})}")
             discipline_name = context.user_data.get('discipline_map', {}).get(discipline_key)
@@ -561,9 +538,26 @@ async def handle_inline_buttons(update, context):
                     )
                     return
                 student_group = result[0]
-                module1_col = f'"{discipline_name} (модуль 1)"'
-                module2_col = f'"{discipline_name} (модуль 2)"'
-                sql_query = f'SELECT student_id, name, {module1_col}, {module2_col} FROM students WHERE student_group=? ORDER BY name'
+                # Проверяем, что нужные столбцы существуют в таблице
+                module1_col = f'{discipline_name} (модуль 1)'
+                module2_col = f'{discipline_name} (модуль 2)'
+                cursor.execute('PRAGMA table_info(students)')
+                columns_info = [col[1] for col in cursor.fetchall()]
+                def normalize_colname(s):
+                    return re.sub(r'\s+', ' ', s.strip().lower())
+                norm_module1 = normalize_colname(module1_col)
+                norm_module2 = normalize_colname(module2_col)
+                module1_col_real = next((c for c in columns_info if normalize_colname(c) == norm_module1), None)
+                module2_col_real = next((c for c in columns_info if normalize_colname(c) == norm_module2), None)
+                if not module1_col_real or not module2_col_real:
+                    await query.message.reply_text(
+                        f"Ошибка: не найден столбец для дисциплины '{discipline_name}' в таблице студентов.\nПопробуйте вручную проверить названия столбцов в базе данных.",
+                        reply_markup=REPLY_KEYBOARD_MARKUP
+                    )
+                    return
+                module1_col_sql = f'"{module1_col_real}"'
+                module2_col_sql = f'"{module2_col_real}"'
+                sql_query = f'SELECT student_id, name, {module1_col_sql}, {module2_col_sql} FROM students WHERE student_group=? ORDER BY name'
                 cursor.execute(sql_query, (student_group,))
                 students = cursor.fetchall()
                 if not students:
@@ -582,11 +576,11 @@ async def handle_inline_buttons(update, context):
                     group_data.append((name, grades))
                 message = format_ratings_table(discipline_name, group_data, is_group=True)
 
-                # Проверяем наличие курсовых работ по дисциплине
-                cursor.execute('SELECT COUNT(*) FROM course_works WHERE discipline=? AND student_group=?', (discipline_name, student_group))
+                # Проверяем наличие курсовых работ по дисциплине (для всех групп)
+                cursor.execute('SELECT COUNT(*) FROM course_works WHERE TRIM(LOWER(discipline))=TRIM(LOWER(?))', (discipline_name,))
                 cw_count = cursor.fetchone()[0]
                 if cw_count > 0:
-                    # Добавляем кнопку "Курсовые работы"
+                    # Добавляем кнопку "Курсовые работы" с коротким ключом
                     keyboard = [
                         [InlineKeyboardButton("Курсовые работы", callback_data=f"courseworks_{discipline_key}")]
                     ]
@@ -623,16 +617,8 @@ async def handle_inline_buttons(update, context):
         conn = get_db_connection()
         cursor = conn.cursor()
         try:
-            cursor.execute('SELECT student_group FROM students WHERE telegram_id=?', (telegram_id,))
-            result = cursor.fetchone()
-            if not result:
-                await query.message.reply_text(
-                    "Группа не найдена. Пожалуйста, зарегистрируйтесь заново.",
-                    reply_markup=REPLY_KEYBOARD_MARKUP
-                )
-                return
-            student_group = result[0]
-            cursor.execute('SELECT name, discipline, file_path, semester FROM course_works WHERE discipline=? AND student_group=?', (discipline_name, student_group))
+            # Показываем все курсовые по дисциплине (без фильтра по группе)
+            cursor.execute('SELECT name, discipline, file_path, semester, student_group FROM course_works WHERE TRIM(LOWER(discipline))=TRIM(LOWER(?))', (discipline_name,))
             course_works = cursor.fetchall()
             if not course_works:
                 await query.message.reply_text(
@@ -640,17 +626,27 @@ async def handle_inline_buttons(update, context):
                     reply_markup=REPLY_KEYBOARD_MARKUP
                 )
                 return
-            # Формируем список работ
-            msg = f"<b>Курсовые работы по дисциплине {discipline_name}:</b>\n"
             buttons = []
-            for idx, (name, discipline, file_path, semester) in enumerate(course_works, 1):
+            coursework_map = {}
+            for idx, (name, discipline, file_path, semester, student_group) in enumerate(course_works, 1):
                 filename = file_path.split('/')[-1]
-                msg += f"{idx}. {name} ({student_group}), {discipline}, семестр {semester}\n"
-                buttons.append([InlineKeyboardButton(f"{name} - {filename}", callback_data=f"getcw_{file_path}")])
+                # Обрезаем ФИО (группа) и имя файла, чтобы кнопка всегда помещалась
+                fio_group = f"{name} ({student_group})"
+                if len(fio_group) > 25:
+                    fio_group = fio_group[:22] + '...'
+                filename_short = filename
+                if len(filename_short) > 30:
+                    filename_short = filename_short[:27] + '...'
+                btn_text = f"{fio_group}\n{filename_short}"
+                cw_key = f"cw{idx}"
+                coursework_map[cw_key] = file_path
+                buttons.append([InlineKeyboardButton(btn_text, callback_data=f"getcw_{cw_key}")])
             # Кнопка для скачивания всех работ архивом (реализация архивации потребуется отдельно)
             buttons.append([InlineKeyboardButton("Скачать все архивом", callback_data=f"getcwzip_{discipline_key}")])
+            # Сохраняем map в user_data
+            context.user_data['coursework_map'] = coursework_map
             await query.message.reply_text(
-                msg,
+                f"<b>Курсовые работы по дисциплине {discipline_name}:</b>",
                 parse_mode='HTML',
                 reply_markup=InlineKeyboardMarkup(buttons)
             )
@@ -663,8 +659,15 @@ async def handle_inline_buttons(update, context):
         finally:
             conn.close()
     elif callback_data.startswith('getcw_'):
-        # Заглушка: отправка отдельной курсовой работы
-        file_path = callback_data[len('getcw_'):]
+        # Отправка отдельной курсовой работы
+        cw_key = callback_data[len('getcw_'):]
+        file_path = context.user_data.get('coursework_map', {}).get(cw_key)
+        if not file_path:
+            await query.message.reply_text(
+                "Ошибка: файл не найден. Попробуйте снова.",
+                reply_markup=REPLY_KEYBOARD_MARKUP
+            )
+            return
         # TODO: реализовать отправку файла пользователю
         await query.message.reply_text(
             f"Файл: {file_path} (отправка файла будет реализована)",
@@ -770,7 +773,5 @@ async def handle_inline_buttons(update, context):
         return
 
     # Обработка других кнопок
-    await query.message.reply_text(
-        "Пожалуйста, используйте кнопки меню.\n\nВы можете вернуться в главное меню командой /cancel.",
-        reply_markup=REPLY_KEYBOARD_MARKUP
-    )
+    # Просто игнорируем неизвестные callback_data без вывода сообщения
+    return
