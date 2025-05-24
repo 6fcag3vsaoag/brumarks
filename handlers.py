@@ -1,5 +1,8 @@
 import re
 import os
+import zipfile
+import tempfile
+import asyncio
 from utils import (
     logger, get_db_connection, check_registration, parse_student_data, save_to_db,
     show_student_rating, format_ratings_table, REPLY_KEYBOARD_MARKUP,
@@ -671,26 +674,66 @@ async def handle_inline_buttons(update, context):
         # Отправка отдельной курсовой работы
         cw_key = callback_data[len('getcw_'):]
         file_path = context.user_data.get('coursework_map', {}).get(cw_key)
-        if not file_path:
+        if not file_path or not os.path.isfile(file_path):
             await query.message.reply_text(
                 "Ошибка: файл не найден. Попробуйте снова.",
                 reply_markup=REPLY_KEYBOARD_MARKUP
             )
             return
-        # TODO: реализовать отправку файла пользователю
-        await query.message.reply_text(
-            f"Файл: {file_path} (отправка файла будет реализована)",
-            reply_markup=REPLY_KEYBOARD_MARKUP
-        )
+        try:
+            with open(file_path, 'rb') as f:
+                await query.message.reply_document(f, filename=os.path.basename(file_path))
+        except Exception as e:
+            logger.error(f"Ошибка при отправке файла: {e}")
+            await query.message.reply_text(
+                "Ошибка при отправке файла.",
+                reply_markup=REPLY_KEYBOARD_MARKUP
+            )
 
     elif callback_data.startswith('getcwzip_'):
-        # Заглушка: отправка архива всех курсовых работ по дисциплине
+        # Отправка архива всех курсовых работ по дисциплине
         discipline_key = callback_data[len('getcwzip_'):]
-        # TODO: реализовать сбор и отправку архива
-        await query.message.reply_text(
-            f"Архив курсовых работ по дисциплине {discipline_key} (отправка архива будет реализована)",
-            reply_markup=REPLY_KEYBOARD_MARKUP
-        )
+        discipline_name = context.user_data.get('discipline_map', {}).get(discipline_key)
+        if not discipline_name:
+            await query.message.reply_text(
+                "Ошибка: дисциплина не найдена. Попробуйте снова.",
+                reply_markup=REPLY_KEYBOARD_MARKUP
+            )
+            return
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute('SELECT file_path FROM course_works WHERE TRIM(LOWER(discipline))=TRIM(LOWER(?))', (discipline_name,))
+            files = [row[0] for row in cursor.fetchall() if row[0] and os.path.isfile(row[0])]
+            if not files:
+                await query.message.reply_text(
+                    "Нет файлов для архивации.",
+                    reply_markup=REPLY_KEYBOARD_MARKUP
+                )
+                return
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.zip') as tmp_zip:
+                zip_path = tmp_zip.name
+            try:
+                with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                    for file in files:
+                        arcname = os.path.basename(file)
+                        zipf.write(file, arcname=arcname)
+                with open(zip_path, 'rb') as f:
+                    await query.message.reply_document(f, filename=f'courseworks_{discipline_key}.zip')
+            finally:
+                if os.path.exists(zip_path):
+                    try:
+                        os.remove(zip_path)
+                    except Exception as e:
+                        logger.warning(f"Не удалось удалить временный архив: {e}")
+        except Exception as e:
+            logger.error(f"Ошибка при создании архива: {e}")
+            await query.message.reply_text(
+                "Ошибка при создании архива.",
+                reply_markup=REPLY_KEYBOARD_MARKUP
+            )
+        finally:
+            conn.close()
     elif callback_data == 'settings':
         # Получаем подробную информацию о пользователе
         conn = get_db_connection()
