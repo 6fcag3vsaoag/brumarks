@@ -1,4 +1,5 @@
 import re
+import os
 from utils import (
     logger, get_db_connection, check_registration, parse_student_data, save_to_db,
     show_student_rating, format_ratings_table, REPLY_KEYBOARD_MARKUP,
@@ -254,28 +255,42 @@ async def handle_message(update, context):
                     context.user_data.clear()
                     return
                 save_to_db(student_id, name, grades, subjects, telegram_id="added by admin", student_group=admin_group)
+                from utils import save_course_work_to_db
+                for cw in course_works:
+                    save_course_work_to_db(
+                        student_id=student_id,
+                        name=name,
+                        telegram_id="added by admin",
+                        student_group=admin_group,
+                        discipline=cw.get('discipline'),
+                        file_path=cw.get('file_path'),
+                        semester=cw.get('semester')
+                    )
                 await update.message.reply_text(
-                    f"Студент {name} добавлен в группу {admin_group}!",
-                    reply_markup=REPLY_KEYBOARD_MARKUP
+                    f"Студент {name} добавлен в группу {admin_group}!\n\nВведите следующий номер студенческого билета или /cancel для выхода.",
+                    reply_markup=CANCEL_KEYBOARD_MARKUP
                 )
+                # context.user_data['awaiting_add_student_id'] оставляем True для продолжения цикла
+                return
             else:
                 name, student_group = student_data
                 if student_group != admin_group:
                     await update.message.reply_text(
-                        f"Студент {name} находится в другой группе ({student_group}).",
-                        reply_markup=REPLY_KEYBOARD_MARKUP
+                        f"Студент {name} находится в другой группе ({student_group}).\n\nВведите следующий номер студенческого билета или /cancel для выхода.",
+                        reply_markup=CANCEL_KEYBOARD_MARKUP
                     )
+                    return
                 else:
                     await update.message.reply_text(
-                        f"Студент {name} уже является членом группы {admin_group}.",
-                        reply_markup=REPLY_KEYBOARD_MARKUP
+                        f"Студент {name} уже является членом группы {admin_group}.\n\nВведите следующий номер студенческого билета или /cancel для выхода.",
+                        reply_markup=CANCEL_KEYBOARD_MARKUP
                     )
+                    return
         except Exception as e:
             logger.error(f"Error processing add student action: {e}")
             await update.message.reply_text("Произошла ошибка при выполнении действия.\n\nВы можете вернуться в главное меню командой /cancel.")
         finally:
             conn.close()
-            context.user_data.clear()
         return
 
     if context.user_data.get('awaiting_superadmin_student_id'):
@@ -629,15 +644,9 @@ async def handle_inline_buttons(update, context):
             buttons = []
             coursework_map = {}
             for idx, (name, discipline, file_path, semester, student_group) in enumerate(course_works, 1):
-                filename = file_path.split('/')[-1]
-                # Обрезаем ФИО (группа) и имя файла, чтобы кнопка всегда помещалась
-                fio_group = f"{name} ({student_group})"
-                if len(fio_group) > 25:
-                    fio_group = fio_group[:22] + '...'
-                filename_short = filename
-                if len(filename_short) > 30:
-                    filename_short = filename_short[:27] + '...'
-                btn_text = f"{fio_group}\n{filename_short}"
+                # Получаем только имя архива без папки
+                filename = os.path.basename(file_path)
+                btn_text = filename
                 cw_key = f"cw{idx}"
                 coursework_map[cw_key] = file_path
                 buttons.append([InlineKeyboardButton(btn_text, callback_data=f"getcw_{cw_key}")])
