@@ -45,6 +45,13 @@ async def handle_message(update, context):
     if context.user_data.get('awaiting_group'):
         student_group = text.upper()
         student_id = context.user_data.get('temp_student_id')
+        # Сообщаем пользователю о начале процесса
+        if not context.user_data.get('registration_in_progress'):
+            context.user_data['registration_in_progress'] = True
+            await update.message.reply_text(
+                "Идет регистрация, пожалуйста, подождите... Это может занять до минуты.",
+                reply_markup=REPLY_KEYBOARD_MARKUP
+            )
         # Парсим только если еще не парсили для этого студента в этой сессии
         if 'temp_parsed_student_id' in context.user_data and context.user_data['temp_parsed_student_id'] == student_id:
             name = context.user_data['temp_name']
@@ -59,6 +66,7 @@ async def handle_message(update, context):
             context.user_data['temp_course_works'] = course_works
             context.user_data['temp_parsed_student_id'] = student_id
         if name == "Unknown":
+            context.user_data.pop('registration_in_progress', None)
             await update.message.reply_text(
                 "Не удалось получить данные по номеру студенческого билета. Проверьте правильность номера или сервер VUZ2 не отвечает. Попробуйте позже.\n\nВы можете отменить действие командой /cancel.",
                 reply_markup=CANCEL_KEYBOARD_MARKUP
@@ -93,12 +101,14 @@ async def handle_message(update, context):
                     file_path=cw.get('file_path'),
                     semester=cw.get('semester')
                 )
+            context.user_data.pop('registration_in_progress', None)
             context.user_data.clear()
             await update.message.reply_text(
                 f"Регистрация завершена! Вы {'стали администратором' if is_admin else 'добавлены в'} группу {student_group}.",
                 reply_markup=REPLY_KEYBOARD_MARKUP
             )
         except Exception as e:
+            context.user_data.pop('registration_in_progress', None)
             logger.error(f"Error saving group: {e}")
             await update.message.reply_text("Произошла ошибка при регистрации.\n\nВы можете вернуться в главное меню командой /cancel.")
         finally:
@@ -290,6 +300,13 @@ async def handle_message(update, context):
     if context.user_data.get('awaiting_superadmin_group'):
         student_group = update.message.text.strip().upper()
         student_id = context.user_data.get('temp_superadmin_student_id')
+        # Сообщаем пользователю о начале процесса
+        if not context.user_data.get('superadmin_registration_in_progress'):
+            context.user_data['superadmin_registration_in_progress'] = True
+            await update.message.reply_text(
+                "Идет регистрация пользователя, пожалуйста, подождите... Это может занять до минуты.",
+                reply_markup=REPLY_KEYBOARD_MARKUP
+            )
         # Парсим только если еще не парсили для этого студента в этой сессии
         if 'temp_superadmin_parsed_student_id' in context.user_data and context.user_data['temp_superadmin_parsed_student_id'] == student_id:
             name = context.user_data['temp_superadmin_name']
@@ -304,6 +321,7 @@ async def handle_message(update, context):
             context.user_data['temp_superadmin_course_works'] = course_works
             context.user_data['temp_superadmin_parsed_student_id'] = student_id
         if name == "Unknown":
+            context.user_data.pop('superadmin_registration_in_progress', None)
             await update.message.reply_text(
                 "Не удалось получить данные по номеру студенческого билета. Проверьте правильность номера или сервер VUZ2 не отвечает. Попробуйте позже.\n\nВы можете отменить действие командой /cancel.",
                 reply_markup=CANCEL_KEYBOARD_MARKUP
@@ -331,11 +349,13 @@ async def handle_message(update, context):
                     file_path=cw.get('file_path'),
                     semester=cw.get('semester')
                 )
+            context.user_data.pop('superadmin_registration_in_progress', None)
             await update.message.reply_text(
                 f"Пользователь {name} успешно добавлен в группу {student_group}.",
                 reply_markup=REPLY_KEYBOARD_MARKUP
             )
         except Exception as e:
+            context.user_data.pop('superadmin_registration_in_progress', None)
             logger.error(f"Ошибка при добавлении пользователя суперадмином: {e}")
             await update.message.reply_text(
                 "Произошла ошибка при добавлении пользователя.",
@@ -576,15 +596,51 @@ async def handle_inline_buttons(update, context):
         await show_student_rating(query, student_id)
 
     elif callback_data == 'settings':
+        # Получаем подробную информацию о пользователе
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute('SELECT name, student_group, is_admin, is_superadmin, student_id, telegram_id FROM students WHERE telegram_id=?', (telegram_id,))
+            user_row = cursor.fetchone()
+            if user_row:
+                name, group, is_admin, is_superadmin, student_id_val, user_telegram_id = user_row
+                status = "Суперадмин" if is_superadmin else ("Админ группы" if is_admin else "Студент")
+                # Ищем администратора группы
+                cursor.execute('SELECT name, telegram_id FROM students WHERE student_group=? AND is_admin=1', (group,))
+                admin_row = cursor.fetchone()
+                if admin_row:
+                    admin_name, admin_telegram_id = admin_row
+                    admin_info = f"\n<b>Администратор группы:</b> {admin_name} (Telegram ID: {admin_telegram_id})"
+                else:
+                    admin_info = "\n<b>Администратор группы:</b> не найден"
+                profile_text = (
+                    f"<b>Ваш профиль</b>\n"
+                    f"ФИО: {name}\n"
+                    f"Группа: {group}\n"
+                    f"ID: {student_id_val}\n"
+                    f"Статус: {status}"
+                    f"{admin_info}"
+                )
+            else:
+                profile_text = "Профиль не найден. Зарегистрируйтесь через кнопку Мой Профиль."
+        except Exception as e:
+            logger.error(f"Ошибка при получении профиля: {e}")
+            profile_text = "Ошибка при получении профиля."
+        finally:
+            conn.close()
+        await query.message.reply_text(profile_text, parse_mode='HTML', reply_markup=REPLY_KEYBOARD_MARKUP)
+        # Кнопки управления
         keyboard = []
         if is_admin:
             keyboard.append([InlineKeyboardButton("Добавить админа", callback_data='add_admin')])
         if is_superadmin:
             keyboard.append([InlineKeyboardButton("Добавить пользователя другой группы", callback_data='add_other_group_user')])
-        await query.message.reply_text(
-            "Настройки:",
-            reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else REPLY_KEYBOARD_MARKUP
-        )
+        if keyboard:
+            await query.message.reply_text(
+                "Настройки:",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+        return
 
     elif callback_data == 'add_other_group_user':
         if not is_superadmin:
