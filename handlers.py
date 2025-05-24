@@ -4,7 +4,7 @@ from utils import (
     show_student_rating, format_ratings_table, REPLY_KEYBOARD_MARKUP,
     CANCEL_KEYBOARD_MARKUP, INLINE_KEYBOARD_MARKUP
 )
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 
 async def handle_message(update, context):
     text = update.message.text.strip()
@@ -23,45 +23,76 @@ async def handle_message(update, context):
     
     if context.user_data.get('awaiting_student_id'):
         student_id = text
-        name, grades, subjects = parse_student_data(student_id)
-        if name == "Unknown":
-            await update.message.reply_text(
-                "Не удалось получить данные по номеру студенческого билета. Проверьте правильность номера или сервер VUZ2 не отвечает. Попробуйте позже.\n\nВы можете отменить действие командой /cancel.",
-                reply_markup=CANCEL_KEYBOARD_MARKUP
-            )
-            return
         context.user_data['temp_student_id'] = student_id
-        context.user_data['temp_name'] = name
-        context.user_data['temp_grades'] = grades
-        context.user_data['temp_subjects'] = subjects
         context.user_data['awaiting_student_id'] = False
         context.user_data['awaiting_group'] = True
+        # Получаем список уникальных групп из базы
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute('SELECT DISTINCT student_group FROM students WHERE student_group IS NOT NULL AND student_group != ""')
+        groups = [row[0] for row in cursor.fetchall() if row[0]]
+        conn.close()
+        # Формируем клавиатуру
+        group_keyboard = [[g] for g in sorted(groups)] if groups else []
+        from telegram import ReplyKeyboardMarkup
+        reply_markup = ReplyKeyboardMarkup(group_keyboard, resize_keyboard=True, one_time_keyboard=True) if group_keyboard else CANCEL_KEYBOARD_MARKUP
         await update.message.reply_text(
-            "Введите название вашей группы (например, ПМР-231):\n\nВы можете отменить действие командой /cancel.",
-            reply_markup=CANCEL_KEYBOARD_MARKUP
+            "Введите группу БОЛЬШИМИ РУССКИМИ БУКВАМИ, например ПМР-231, либо выберите из групп, которые уже зарегистрированы в боте:",
+            reply_markup=reply_markup
         )
         return
 
     if context.user_data.get('awaiting_group'):
         student_group = text.upper()
+        student_id = context.user_data.get('temp_student_id')
+        # Парсим только если еще не парсили для этого студента в этой сессии
+        if 'temp_parsed_student_id' in context.user_data and context.user_data['temp_parsed_student_id'] == student_id:
+            name = context.user_data['temp_name']
+            grades = context.user_data['temp_grades']
+            subjects = context.user_data['temp_subjects']
+            course_works = context.user_data['temp_course_works']
+        else:
+            name, grades, subjects, course_works = parse_student_data(student_id)
+            context.user_data['temp_name'] = name
+            context.user_data['temp_grades'] = grades
+            context.user_data['temp_subjects'] = subjects
+            context.user_data['temp_course_works'] = course_works
+            context.user_data['temp_parsed_student_id'] = student_id
+        if name == "Unknown":
+            await update.message.reply_text(
+                "Не удалось получить данные по номеру студенческого билета. Проверьте правильность номера или сервер VUZ2 не отвечает. Попробуйте позже.\n\nВы можете отменить действие командой /cancel.",
+                reply_markup=CANCEL_KEYBOARD_MARKUP
+            )
+            context.user_data.clear()
+            return
         conn = get_db_connection()
         cursor = conn.cursor()
-        
         try:
             cursor.execute('SELECT COUNT(*) FROM students WHERE student_group=?', (student_group,))
             group_exists = cursor.fetchone()[0] > 0
             is_admin = not group_exists
 
             save_to_db(
-                student_id=context.user_data['temp_student_id'],
-                name=context.user_data['temp_name'],
-                grades=context.user_data['temp_grades'],
-                subjects=context.user_data['temp_subjects'],
+                student_id=student_id,
+                name=name,
+                grades=grades,
+                subjects=subjects,
                 telegram_id=telegram_id,
                 student_group=student_group,
                 is_admin=is_admin
             )
-
+            # Сохраняем курсовые работы
+            for cw in course_works:
+                from utils import save_course_work_to_db
+                save_course_work_to_db(
+                    student_id=student_id,
+                    name=name,
+                    telegram_id=telegram_id,
+                    student_group=student_group,
+                    discipline=cw.get('discipline'),
+                    file_path=cw.get('file_path'),
+                    semester=cw.get('semester')
+                )
             context.user_data.clear()
             await update.message.reply_text(
                 f"Регистрация завершена! Вы {'стали администратором' if is_admin else 'добавлены в'} группу {student_group}.",

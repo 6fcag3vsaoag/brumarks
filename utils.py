@@ -217,16 +217,6 @@ def parse_student_data(student_id, telegram_id=None, student_group=None):
                                     'semester': semester,
                                     'file_path': file_path
                                 })
-                                # Save to course_works table
-                                save_course_work_to_db(
-                                    student_id=student_id,
-                                    name=full_name,
-                                    telegram_id=telegram_id or "added by admin",
-                                    student_group=student_group,
-                                    discipline=discipline,
-                                    file_path=file_path,
-                                    semester=semester
-                                )
     except Exception as e:
         logger.error(f"Ошибка при парсинге курсовых работ для ID {student_id}: {e}")
 
