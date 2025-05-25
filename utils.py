@@ -127,6 +127,7 @@ def download_course_work_file(url, student_id, semester):
         base, ext = os.path.splitext(original_filename)
         unique_filename = f"{base}{ext}"
         file_path = os.path.join(COURSE_WORKS_DIR, unique_filename)
+        file_path = os.path.normpath(file_path)
         with open(file_path, 'wb') as f:
             f.write(response.content)
         logger.info(f"Downloaded course work file: {file_path}")
@@ -139,6 +140,7 @@ def save_course_work_to_db(student_id, name, telegram_id, student_group, discipl
     """
     Save course work details to the course_works table.
     """
+    file_path = os.path.normpath(file_path) if file_path else file_path
     with get_db_connection() as conn:
         cursor = conn.cursor()
         parsing_time = datetime.datetime.now().isoformat()
