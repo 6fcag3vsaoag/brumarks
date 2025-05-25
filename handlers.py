@@ -693,8 +693,9 @@ async def handle_inline_buttons(update, context):
                 filename = os.path.basename(file_path)
                 btn_text = filename
                 cw_key = f"cw{idx}"
-                coursework_map[cw_key] = file_path
-                logger.info(f"courseworks_: добавлен coursework_map[{cw_key}]={file_path}")
+                norm_file_path = os.path.normpath(file_path) if file_path else file_path
+                coursework_map[cw_key] = norm_file_path
+                logger.info(f"courseworks_: добавлен coursework_map[{cw_key}]={norm_file_path}")
                 buttons.append([InlineKeyboardButton(btn_text, callback_data=f"getcw_{cw_key}")])
             # Кнопка для скачивания всех работ архивом
             buttons.append([InlineKeyboardButton("Скачать все архивом", callback_data=f"getcwzip_{discipline_key}")])
@@ -719,11 +720,12 @@ async def handle_inline_buttons(update, context):
         cw_key = callback_data[len('getcw_'):]
         # Получаем путь к файлу из сохранённой map
         file_path = context.user_data.get('coursework_map', {}).get(cw_key)
-        logger.info(f"getcw_: cw_key={cw_key}, file_path={file_path}")
+        norm_file_path = os.path.normpath(file_path) if file_path else file_path
+        logger.info(f"getcw_: cw_key={cw_key}, file_path={norm_file_path}")
         # Проверяем, существует ли файл физически
-        file_exists = file_path and os.path.isfile(file_path)
+        file_exists = norm_file_path and os.path.isfile(norm_file_path)
         logger.info(f"getcw_: file_exists={file_exists}")
-        if not file_path or not file_exists:
+        if not norm_file_path or not file_exists:
             logger.error(f"getcw_: Файл не найден. coursework_map={context.user_data.get('coursework_map', {})}")
             await query.message.reply_text(
                 "Ошибка: файл не найден. Попробуйте снова.",
@@ -731,11 +733,11 @@ async def handle_inline_buttons(update, context):
             )
             return
         try:
-            with open(file_path, 'rb') as f:
-                logger.info(f"getcw_: отправка файла {file_path}")
-                await query.message.reply_document(f, filename=os.path.basename(file_path))
+            with open(norm_file_path, 'rb') as f:
+                logger.info(f"getcw_: отправка файла {norm_file_path}")
+                await query.message.reply_document(f, filename=os.path.basename(norm_file_path))
         except Exception as e:
-            logger.error(f"Ошибка при отправке файла {file_path}: {e}")
+            logger.error(f"Ошибка при отправке файла {norm_file_path}: {e}")
             await query.message.reply_text(
                 "Ошибка при отправке файла.",
                 reply_markup=REPLY_KEYBOARD_MARKUP
@@ -758,7 +760,7 @@ async def handle_inline_buttons(update, context):
         cursor = conn.cursor()
         try:
             cursor.execute('SELECT file_path FROM course_works WHERE TRIM(LOWER(discipline))=TRIM(LOWER(?))', (discipline_name,))
-            files = [row[0] for row in cursor.fetchall() if row[0] and os.path.isfile(row[0])]
+            files = [os.path.normpath(row[0]) for row in cursor.fetchall() if row[0] and os.path.isfile(os.path.normpath(row[0]))]
             logger.info(f"getcwzip_: найдено файлов для архивации: {files}")
             if not files:
                 await query.message.reply_text(
