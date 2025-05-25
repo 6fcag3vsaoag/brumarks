@@ -259,11 +259,11 @@ def save_to_db(student_id, name, grades, subjects, telegram_id=None, student_gro
                     data[col_name] = grades.get(col_name, None)
                 else:
                     data[col_name] = "не изучает"
-        columns = [f'"{k.replace("\"", "\"\"")}"' for k in data.keys()]
+        columns = ['"{}"'.format(k.replace('"', '""')) for k in data.keys()]
         query = f"""
         INSERT INTO students ({','.join(columns)}) 
         VALUES ({','.join(['?']*len(data))})
-        ON CONFLICT(student_id) DO UPDATE SET {','.join([f'"{k.replace("\"", "\"\"")}"=?' for k in data.keys()])}
+        ON CONFLICT(student_id) DO UPDATE SET {','.join(['"{}"=?'.format(k.replace('"', '""')) for k in data.keys()])}
         """
         cursor.execute(query, list(data.values())*2)
         conn.commit()
