@@ -1,5 +1,4 @@
 import sqlite3
-import os
 
 DB_PATH = 'students.db'
 
@@ -12,10 +11,10 @@ def migrate_file_paths():
     for rowid, file_path in rows:
         if not file_path:
             continue
-        # Привести путь к нормализованному виду (для текущей ОС)
-        norm_path = os.path.normpath(file_path)
-        if norm_path != file_path:
-            cursor.execute('UPDATE course_works SET file_path=? WHERE rowid=?', (norm_path, rowid))
+        # Заменяем все обратные слэши на прямые
+        fixed_path = file_path.replace('\\', '/')
+        if fixed_path != file_path:
+            cursor.execute('UPDATE course_works SET file_path=? WHERE rowid=?', (fixed_path, rowid))
             updated += 1
     conn.commit()
     conn.close()
