@@ -659,10 +659,15 @@ async def handle_inline_buttons(update, context):
             logger.error(f"Unexpected error in discipline handler: {inner_error}")
 
     elif callback_data.startswith('courseworks_'):
-        # Показываем список курсовых работ по дисциплине
+        # --- Показываем список курсовых работ по дисциплине ---
         discipline_key = callback_data[len('courseworks_'):]
+        # Логируем ключ дисциплины
+        logger.info(f"courseworks_: discipline_key={discipline_key}")
+        # Получаем название дисциплины по ключу из user_data
         discipline_name = context.user_data.get('discipline_map', {}).get(discipline_key)
+        logger.info(f"courseworks_: discipline_name={discipline_name}")
         if not discipline_name:
+            logger.error(f"courseworks_: Не найдено название дисциплины по ключу {discipline_key}. discipline_map={context.user_data.get('discipline_map', {})}")
             await query.message.reply_text(
                 "Ошибка: дисциплина не найдена. Попробуйте снова.",
                 reply_markup=REPLY_KEYBOARD_MARKUP
@@ -671,9 +676,10 @@ async def handle_inline_buttons(update, context):
         conn = get_db_connection()
         cursor = conn.cursor()
         try:
-            # Показываем все курсовые по дисциплине (без фильтра по группе)
+            # Получаем все курсовые работы по дисциплине (без фильтра по группе)
             cursor.execute('SELECT name, discipline, file_path, semester, student_group FROM course_works WHERE TRIM(LOWER(discipline))=TRIM(LOWER(?))', (discipline_name,))
             course_works = cursor.fetchall()
+            logger.info(f"courseworks_: найдено {len(course_works)} курсовых работ по дисциплине {discipline_name}")
             if not course_works:
                 await query.message.reply_text(
                     "Курсовые работы по этой дисциплине не найдены.",
@@ -688,11 +694,13 @@ async def handle_inline_buttons(update, context):
                 btn_text = filename
                 cw_key = f"cw{idx}"
                 coursework_map[cw_key] = file_path
+                logger.info(f"courseworks_: добавлен coursework_map[{cw_key}]={file_path}")
                 buttons.append([InlineKeyboardButton(btn_text, callback_data=f"getcw_{cw_key}")])
-            # Кнопка для скачивания всех работ архивом (реализация архивации потребуется отдельно)
+            # Кнопка для скачивания всех работ архивом
             buttons.append([InlineKeyboardButton("Скачать все архивом", callback_data=f"getcwzip_{discipline_key}")])
             # Сохраняем map в user_data
             context.user_data['coursework_map'] = coursework_map
+            logger.info(f"courseworks_: coursework_map={coursework_map}")
             await query.message.reply_text(
                 f"<b>Курсовые работы по дисциплине {discipline_name}:</b>",
                 parse_mode='HTML',
@@ -707,10 +715,16 @@ async def handle_inline_buttons(update, context):
         finally:
             conn.close()
     elif callback_data.startswith('getcw_'):
-        # Отправка отдельной курсовой работы
+        # --- Отправка отдельной курсовой работы ---
         cw_key = callback_data[len('getcw_'):]
+        # Получаем путь к файлу из сохранённой map
         file_path = context.user_data.get('coursework_map', {}).get(cw_key)
-        if not file_path or not os.path.isfile(file_path):
+        logger.info(f"getcw_: cw_key={cw_key}, file_path={file_path}")
+        # Проверяем, существует ли файл физически
+        file_exists = file_path and os.path.isfile(file_path)
+        logger.info(f"getcw_: file_exists={file_exists}")
+        if not file_path or not file_exists:
+            logger.error(f"getcw_: Файл не найден. coursework_map={context.user_data.get('coursework_map', {})}")
             await query.message.reply_text(
                 "Ошибка: файл не найден. Попробуйте снова.",
                 reply_markup=REPLY_KEYBOARD_MARKUP
@@ -718,19 +732,23 @@ async def handle_inline_buttons(update, context):
             return
         try:
             with open(file_path, 'rb') as f:
+                logger.info(f"getcw_: отправка файла {file_path}")
                 await query.message.reply_document(f, filename=os.path.basename(file_path))
         except Exception as e:
-            logger.error(f"Ошибка при отправке файла: {e}")
+            logger.error(f"Ошибка при отправке файла {file_path}: {e}")
             await query.message.reply_text(
                 "Ошибка при отправке файла.",
                 reply_markup=REPLY_KEYBOARD_MARKUP
             )
 
     elif callback_data.startswith('getcwzip_'):
-        # Отправка архива всех курсовых работ по дисциплине
+        # --- Отправка архива всех курсовых работ по дисциплине ---
         discipline_key = callback_data[len('getcwzip_'):]
+        logger.info(f"getcwzip_: discipline_key={discipline_key}")
         discipline_name = context.user_data.get('discipline_map', {}).get(discipline_key)
+        logger.info(f"getcwzip_: discipline_name={discipline_name}")
         if not discipline_name:
+            logger.error(f"getcwzip_: Не найдено название дисциплины по ключу {discipline_key}. discipline_map={context.user_data.get('discipline_map', {})}")
             await query.message.reply_text(
                 "Ошибка: дисциплина не найдена. Попробуйте снова.",
                 reply_markup=REPLY_KEYBOARD_MARKUP
@@ -741,6 +759,7 @@ async def handle_inline_buttons(update, context):
         try:
             cursor.execute('SELECT file_path FROM course_works WHERE TRIM(LOWER(discipline))=TRIM(LOWER(?))', (discipline_name,))
             files = [row[0] for row in cursor.fetchall() if row[0] and os.path.isfile(row[0])]
+            logger.info(f"getcwzip_: найдено файлов для архивации: {files}")
             if not files:
                 await query.message.reply_text(
                     "Нет файлов для архивации.",
@@ -753,13 +772,16 @@ async def handle_inline_buttons(update, context):
                 with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
                     for file in files:
                         arcname = os.path.basename(file)
+                        logger.info(f"getcwzip_: добавление в архив {file} как {arcname}")
                         zipf.write(file, arcname=arcname)
                 with open(zip_path, 'rb') as f:
+                    logger.info(f"getcwzip_: отправка архива {zip_path}")
                     await query.message.reply_document(f, filename=f'courseworks_{discipline_key}.zip')
             finally:
                 if os.path.exists(zip_path):
                     try:
                         os.remove(zip_path)
+                        logger.info(f"getcwzip_: временный архив {zip_path} удалён")
                     except Exception as e:
                         logger.warning(f"Не удалось удалить временный архив: {e}")
         except Exception as e:
@@ -775,26 +797,34 @@ async def handle_inline_buttons(update, context):
         conn = get_db_connection()
         cursor = conn.cursor()
         try:
-            cursor.execute('SELECT name, student_group, is_admin, is_superadmin, student_id, telegram_id FROM students WHERE telegram_id=?', (telegram_id,))
+            cursor.execute('SELECT name, student_group, is_admin, is_superadmin, student_id FROM students WHERE telegram_id=?', (telegram_id,))
             user_row = cursor.fetchone()
             if user_row:
-                name, group, is_admin, is_superadmin, student_id_val, user_telegram_id = user_row
+                name, group, is_admin, is_superadmin, student_id_val = user_row
                 status = "Суперадмин" if is_superadmin else ("Админ группы" if is_admin else "Студент")
-                # Ищем администратора группы
-                cursor.execute('SELECT name, telegram_id FROM students WHERE student_group=? AND is_admin=1', (group,))
-                admin_row = cursor.fetchone()
-                if admin_row:
-                    admin_name, admin_telegram_id = admin_row
-                    admin_info = f"\n<b>Администратор группы:</b> {admin_name} (Telegram ID: {admin_telegram_id})"
-                else:
-                    admin_info = "\n<b>Администратор группы:</b> не найден"
+                # Ищем всех администраторов группы
+                cursor.execute('SELECT name FROM students WHERE student_group=? AND is_admin=1', (group,))
+                admin_rows = cursor.fetchall()
+                admin_info = "\nAdmin_list:"
+                for (admin_name,) in admin_rows:
+                    admin_info += f"\n• {admin_name}"
+                # --- Блок с информацией для администраторов и желающих ими стать ---
+                admin_help_block = (
+                    "\n\n"
+                    "<b>Возможности администратора:</b>\n"
+                    "Администратор может добавлять одногруппников в базу данных бота (даже без их ведома) для отслеживания и контроля общей успеваемости всей группы."
+                    "Если вы хотите стать администратором для своей группы, свяжитесь с:\n"
+                    "email: 6fcag3vsaoag@mail.ru\n"
+                    "TG: <a href='https://t.me/bycard1'>@bycard1</a>\n"
+                )
                 profile_text = (
                     f"<b>Ваш профиль</b>\n"
-                    f"ФИО: {name}\n"
-                    f"Группа: {group}\n"
-                    f"ID: {student_id_val}\n"
-                    f"Статус: {status}"
+                    f"Name: {name}\n"
+                    f"Group: {group}\n"
+                    f"Student_ID: {student_id_val}\n"
+                    f"Status: {status}"
                     f"{admin_info}"
+                    f"{admin_help_block}"
                 )
             else:
                 profile_text = "Профиль не найден. Зарегистрируйтесь через кнопку Мой Профиль."
