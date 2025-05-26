@@ -42,7 +42,7 @@ class StudentParserScheduler:
                         FROM students 
                         WHERE last_parsed_time IS NULL 
                         OR datetime(last_parsed_time) <= datetime(?)
-                    ''', (current_time - datetime.timedelta(minutes=5),))
+                    ''', (current_time - datetime.timedelta(hours=2),))
                     students = cursor.fetchall()
 
                 # Добавляем студентов в очередь
@@ -50,7 +50,7 @@ class StudentParserScheduler:
                     await self.parsing_queue.put(student)
 
                 # Ждем 2 часа перед следующей проверкой
-                await asyncio.sleep(5 * 60)  # 5 минут в секундах
+                await asyncio.sleep(2 * 60 * 60)  # 2 часа в секундах
 
             except Exception as e:
                 logger.error(f"Ошибка в планировщике парсинга: {e}")
