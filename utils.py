@@ -139,10 +139,20 @@ def download_course_work_file(url, student_id, semester):
 def save_course_work_to_db(student_id, name, telegram_id, student_group, discipline, file_path, semester):
     """
     Save course work details to the course_works table.
+    Skip if the work already exists.
     """
     file_path = os.path.normpath(file_path) if file_path else file_path
     with get_db_connection() as conn:
         cursor = conn.cursor()
+        # Проверяем существование записи
+        cursor.execute('''
+            SELECT 1 FROM course_works 
+            WHERE student_id = ? AND discipline = ? AND semester = ?
+        ''', (student_id, discipline, semester))
+        if cursor.fetchone():
+            logger.info(f"Пропускаем сохранение существующей курсовой работы: student_id {student_id}, discipline {discipline}, semester {semester}")
+            return
+            
         parsing_time = datetime.datetime.now().isoformat()
         cursor.execute('''
             INSERT INTO course_works (discipline, student_id, telegram_id, name, student_group, semester, file_path, parsing_time)
@@ -151,7 +161,7 @@ def save_course_work_to_db(student_id, name, telegram_id, student_group, discipl
         conn.commit()
         logger.info(f"Saved course work for student_id {student_id}, discipline {discipline}")
 
-def parse_student_data(student_id, telegram_id=None, student_group=None):
+def parse_student_data(student_id, telegram_id=None, student_group=None, skip_existing_course_works=None):
     """
     Parse student data and course works from VUZ2 website.
     Returns: (name, grades, subjects, course_works)
@@ -213,6 +223,45 @@ def parse_student_data(student_id, telegram_id=None, student_group=None):
                     if semester_match and discipline_match:
                         semester = semester_match.group(1)
                         discipline = discipline_match.group(1).strip()
+                        
+                        # Проверяем существование курсовой работы
+                        if skip_existing_course_works and (discipline, semester) in skip_existing_course_works:
+                            logger.info(f"Пропускаем существующую курсовую работу: {discipline}, семестр {semester}")
+                            # Добавляем существующую работу в список без скачивания
+                            course_works.append({
+                                'discipline': discipline,
+                                'semester': semester,
+                                'file_path': skip_existing_course_works[(discipline, semester)]
+                            })
+                            continue
+                            
+                        # Проверяем существование в базе данных
+                        with get_db_connection() as conn:
+                            cursor = conn.cursor()
+                            cursor.execute('''
+                                SELECT file_path FROM course_works 
+                                WHERE student_id = ? AND discipline = ? AND semester = ?
+                            ''', (student_id, discipline, semester))
+                            existing = cursor.fetchone()
+                            if existing:
+                                logger.info(f"Пропускаем скачивание существующей курсовой работы: {discipline}, семестр {semester}")
+                                # Обновляем telegram_id для существующей записи
+                                if telegram_id:
+                                    cursor.execute('''
+                                        UPDATE course_works 
+                                        SET telegram_id = ? 
+                                        WHERE student_id = ? AND discipline = ? AND semester = ?
+                                    ''', (telegram_id, student_id, discipline, semester))
+                                    conn.commit()
+                                    logger.info(f"Обновлен telegram_id для курсовой работы: {discipline}, семестр {semester}")
+                                course_works.append({
+                                    'discipline': discipline,
+                                    'semester': semester,
+                                    'file_path': existing[0]
+                                })
+                                continue
+                            
+                        # Если работа не существует, скачиваем её
                         file_link = li.find('a')
                         if file_link and 'href' in file_link.attrs:
                             file_url = file_link['href']
@@ -220,6 +269,16 @@ def parse_student_data(student_id, telegram_id=None, student_group=None):
                                 file_url = f"http://vuz2.bru.by{file_url}"
                             file_path = download_course_work_file(file_url, student_id, semester)
                             if file_path:
+                                # Сохраняем информацию о курсовой работе в базу данных
+                                save_course_work_to_db(
+                                    student_id=student_id,
+                                    name=full_name,
+                                    telegram_id=telegram_id,
+                                    student_group=student_group,
+                                    discipline=discipline,
+                                    file_path=file_path,
+                                    semester=semester
+                                )
                                 course_works.append({
                                     'discipline': discipline,
                                     'semester': semester,
