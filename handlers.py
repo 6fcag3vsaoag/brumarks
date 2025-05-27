@@ -6,7 +6,7 @@ import asyncio
 from utils import (
     logger, get_db_connection, check_registration, parse_student_data, save_to_db,
     show_student_rating, format_ratings_table, REPLY_KEYBOARD_MARKUP,
-    CANCEL_KEYBOARD_MARKUP, INLINE_KEYBOARD_MARKUP
+    CANCEL_KEYBOARD_MARKUP, INLINE_KEYBOARD_MARKUP, validate_student_id
 )
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 
@@ -27,6 +27,15 @@ async def handle_message(update, context):
     
     if context.user_data.get('awaiting_student_id'):
         student_id = text
+        # Проверяем валидность student_id
+        is_valid, error_message = validate_student_id(student_id)
+        if not is_valid:
+            await update.message.reply_text(
+                f"Ошибка: {error_message}\n\nПожалуйста, введите корректный номер студенческого билета или отмените действие командой /cancel.",
+                reply_markup=CANCEL_KEYBOARD_MARKUP
+            )
+            return
+
         conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute('SELECT name, student_group FROM students WHERE student_id=?', (student_id,))
@@ -269,6 +278,15 @@ async def handle_message(update, context):
 
     if context.user_data.get('awaiting_add_student_id'):
         student_id = text
+        # Проверяем валидность student_id
+        is_valid, error_message = validate_student_id(student_id)
+        if not is_valid:
+            await update.message.reply_text(
+                f"Ошибка: {error_message}\n\nПожалуйста, введите корректный номер студенческого билета или отмените действие командой /cancel.",
+                reply_markup=CANCEL_KEYBOARD_MARKUP
+            )
+            return
+
         conn = get_db_connection()
         cursor = conn.cursor()
         try:
@@ -334,6 +352,15 @@ async def handle_message(update, context):
 
     if context.user_data.get('awaiting_superadmin_student_id'):
         student_id = update.message.text.strip()
+        # Проверяем валидность student_id
+        is_valid, error_message = validate_student_id(student_id)
+        if not is_valid:
+            await update.message.reply_text(
+                f"Ошибка: {error_message}\n\nПожалуйста, введите корректный номер студенческого билета или отмените действие командой /cancel.",
+                reply_markup=CANCEL_KEYBOARD_MARKUP
+            )
+            return
+
         context.user_data['temp_superadmin_student_id'] = student_id
         context.user_data['awaiting_superadmin_student_id'] = False
         context.user_data['awaiting_superadmin_group'] = True

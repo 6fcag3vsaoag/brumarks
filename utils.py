@@ -161,17 +161,45 @@ def save_course_work_to_db(student_id, name, telegram_id, student_group, discipl
         conn.commit()
         logger.info(f"Saved course work for student_id {student_id}, discipline {discipline}")
 
+def validate_student_id(student_id):
+    """
+    Проверяет валидность номера студенческого билета.
+    Returns: (is_valid, error_message)
+    """
+    # Проверяем, что student_id является числом
+    if not student_id.isdigit():
+        return False, "Номер студенческого билета должен содержать только цифры"
+    
+    # Проверяем длину (обычно 8 цифр)
+    if len(student_id) != 8:
+        return False, "Номер студенческого билета должен содержать 8 цифр"
+    
+    return True, None
+
 def parse_student_data(student_id, telegram_id=None, student_group=None, skip_existing_course_works=None):
     """
     Parse student data and course works from VUZ2 website.
     Returns: (name, grades, subjects, course_works)
     """
+    # Валидация student_id
+    is_valid, error_message = validate_student_id(student_id)
+    if not is_valid:
+        logger.error(f"Невалидный student_id: {student_id} - {error_message}")
+        return "Unknown", {}, [], []
+
     # Parse student performance data
     url = f"http://vuz2.bru.by/rate/{student_id}/"
     try:
         response = requests.get(url, timeout=10)
         response.raise_for_status()
         soup = BeautifulSoup(response.content, 'html.parser', from_encoding='utf-8')
+        
+        # Проверяем наличие сообщения об ошибке
+        error_message = soup.find('h2')
+        if error_message and "не найден" in error_message.text:
+            logger.error(f"Студент с номером {student_id} не найден в системе VUZ2")
+            return "Unknown", {}, [], []
+            
         data_box = soup.find('div', class_='box data')
         if data_box:
             name_tag = data_box.find('h1')
