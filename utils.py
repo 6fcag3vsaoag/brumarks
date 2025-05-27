@@ -176,6 +176,51 @@ def validate_student_id(student_id):
     
     return True, None
 
+def validate_group_format(group):
+    """
+    Проверяет формат названия группы.
+    Формат: 2-6 заглавных русских букв, тире, 2-3 цифры
+    Returns: (is_valid, error_message)
+    """
+    pattern = r'^[А-Я]{2,6}-\d{2,3}$'
+    if not re.match(pattern, group):
+        return False, "Неверный формат группы. Примеры правильного формата: ПМР-231, БИОР-221"
+    return True, None
+
+def validate_student_group(student_id, group):
+    """
+    Проверяет, соответствует ли студент указанной группе.
+    Returns: (is_valid, error_message)
+    """
+    url = f"http://vuz2.bru.by/rate/{student_id}/"
+    try:
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.content, 'html.parser', from_encoding='utf-8')
+        
+        # Проверяем наличие сообщения об ошибке
+        error_message = soup.find('h2')
+        if error_message and "не найден" in error_message.text:
+            return False, "Студент не найден в системе VUZ2"
+            
+        # Ищем информацию о группе на странице
+        data_box = soup.find('div', class_='box data')
+        if data_box:
+            # Ищем текст, содержащий информацию о группе
+            group_info = data_box.find(text=re.compile(r'группа|Группа', re.IGNORECASE))
+            if group_info:
+                # Извлекаем номер группы из текста
+                group_match = re.search(r'[А-Я]{2,6}-\d{2,3}', group_info)
+                if group_match:
+                    actual_group = group_match.group(0)
+                    if actual_group != group:
+                        return False, f"Студент состоит в группе {actual_group}, а не в {group}"
+                    return True, None
+        return False, "Не удалось определить группу студента"
+    except Exception as e:
+        logger.error(f"Ошибка при проверке группы студента: {e}")
+        return False, "Ошибка при проверке группы студента"
+
 def parse_student_data(student_id, telegram_id=None, student_group=None, skip_existing_course_works=None):
     """
     Parse student data and course works from VUZ2 website.

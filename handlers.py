@@ -6,7 +6,7 @@ import asyncio
 from utils import (
     logger, get_db_connection, check_registration, parse_student_data, save_to_db,
     show_student_rating, format_ratings_table, REPLY_KEYBOARD_MARKUP,
-    CANCEL_KEYBOARD_MARKUP, INLINE_KEYBOARD_MARKUP, validate_student_id
+    CANCEL_KEYBOARD_MARKUP, INLINE_KEYBOARD_MARKUP, validate_student_id, validate_group_format, validate_student_group
 )
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 
@@ -77,6 +77,40 @@ async def handle_message(update, context):
         student_group = text.upper()
         student_id = context.user_data.get('temp_student_id')
         telegram_id = str(update.effective_user.id)
+        
+        # Сначала проверяем формат группы
+        is_valid_format, format_error = validate_group_format(student_group)
+        if not is_valid_format:
+            context.user_data.clear()  # Сбрасываем состояние
+            context.user_data['awaiting_student_id'] = True  # Возвращаем к вводу student_id
+            await update.message.reply_text(
+                f"Ошибка: {format_error}\n\nПожалуйста, введите номер студенческого билета или отмените действие командой /cancel.",
+                reply_markup=CANCEL_KEYBOARD_MARKUP
+            )
+            return
+
+        # Проверяем существование студента и его группу
+        name, grades, subjects, course_works = parse_student_data(student_id)
+        if name == "Unknown":
+            context.user_data.clear()  # Сбрасываем состояние
+            context.user_data['awaiting_student_id'] = True  # Возвращаем к вводу student_id
+            await update.message.reply_text(
+                "Не удалось получить данные по номеру студенческого билета. Проверьте правильность номера или сервер VUZ2 не отвечает. Попробуйте позже.\n\nПожалуйста, введите номер студенческого билета или отмените действие командой /cancel.",
+                reply_markup=CANCEL_KEYBOARD_MARKUP
+            )
+            return
+            
+        # Проверяем соответствие студента группе
+        is_valid_group, group_error = validate_student_group(student_id, student_group)
+        if not is_valid_group:
+            context.user_data.clear()  # Сбрасываем состояние
+            context.user_data['awaiting_student_id'] = True  # Возвращаем к вводу student_id
+            await update.message.reply_text(
+                f"Ошибка: {group_error}\n\nПожалуйста, введите номер студенческого билета или отмените действие командой /cancel.",
+                reply_markup=CANCEL_KEYBOARD_MARKUP
+            )
+            return
+
         conn = get_db_connection()
         cursor = conn.cursor()
         # Проверяем, есть ли студент с таким student_id
