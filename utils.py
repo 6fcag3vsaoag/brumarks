@@ -189,7 +189,7 @@ def validate_group_format(group):
 
 def validate_student_group(student_id, group):
     """
-    Проверяет, соответствует ли студент указанной группе.
+    Проверяет существование студента на сайте VUZ2.
     Returns: (is_valid, error_message)
     """
     url = f"http://vuz2.bru.by/rate/{student_id}/"
@@ -203,23 +203,10 @@ def validate_student_group(student_id, group):
         if error_message and "не найден" in error_message.text:
             return False, "Студент не найден в системе VUZ2"
             
-        # Ищем информацию о группе на странице
-        data_box = soup.find('div', class_='box data')
-        if data_box:
-            # Ищем текст, содержащий информацию о группе
-            group_info = data_box.find(text=re.compile(r'группа|Группа', re.IGNORECASE))
-            if group_info:
-                # Извлекаем номер группы из текста
-                group_match = re.search(r'[А-Я]{2,6}-\d{2,3}', group_info)
-                if group_match:
-                    actual_group = group_match.group(0)
-                    if actual_group != group:
-                        return False, f"Студент состоит в группе {actual_group}, а не в {group}"
-                    return True, None
-        return False, "Не удалось определить группу студента"
+        return True, None
     except Exception as e:
-        logger.error(f"Ошибка при проверке группы студента: {e}")
-        return False, "Ошибка при проверке группы студента"
+        logger.error(f"Ошибка при проверке студента: {e}")
+        return False, "Ошибка при проверке студента"
 
 def parse_student_data(student_id, telegram_id=None, student_group=None, skip_existing_course_works=None):
     """
