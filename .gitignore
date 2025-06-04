@@ -5,3 +5,4 @@ course_works/
 __pycache__/
 bot.log
 students — копия.db
+venv/
