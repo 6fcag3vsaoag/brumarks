@@ -90,22 +90,31 @@ application.add_handler(CallbackQueryHandler(handle_inline_buttons))
 
 def handle_exception(loop, context):
     """Обработчик исключений в event loop"""
-    msg = context.get("exception", context["message"])
-    if hasattr(context.get('future'), '_coro'):
-        # Получаем информацию о пользователе из корутины, если она есть
-        coro = context.get('future')._coro
-        if hasattr(coro, 'cr_frame'):
-            locals_dict = coro.cr_frame.f_locals
-            if 'update' in locals_dict and hasattr(locals_dict['update'], 'effective_user'):
-                user_id = locals_dict['update'].effective_user.id
-                logger.error(f"Ошибка в event loop для пользователя {user_id}: {msg}")
-            else:
-                logger.error(f"Ошибка в event loop (без ID пользователя): {msg}")
+    try:
+        msg = context.get("exception", context["message"])
+        user_id = None
+        
+        # Безопасное получение user_id
+        if hasattr(context.get('future'), '_coro'):
+            coro = context.get('future')._coro
+            if hasattr(coro, 'cr_frame'):
+                locals_dict = coro.cr_frame.f_locals
+                if 'update' in locals_dict and hasattr(locals_dict['update'], 'effective_user'):
+                    user_id = locals_dict['update'].effective_user.id
+
+        if user_id:
+            logger.error(f"Ошибка в event loop для пользователя {user_id}: {msg}")
         else:
-            logger.error(f"Ошибка в event loop (без контекста корутины): {msg}")
-    else:
-        logger.error(f"Ошибка в event loop (без future): {msg}")
-    logger.error(f"Traceback: {traceback.format_exc()}")
+            logger.error(f"Ошибка в event loop: {msg}")
+
+        if isinstance(msg, Exception):
+            logger.error(f"Тип ошибки: {type(msg).__name__}")
+            logger.error(f"Traceback: {traceback.format_exc()}")
+    except Exception as e:
+        # Если что-то пошло не так в самом обработчике исключений
+        logger.error(f"Ошибка в обработчике исключений: {str(e)}")
+        logger.error(f"Оригинальное сообщение: {context.get('message', 'Неизвестно')}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
 
 async def run_polling():
     """Запуск поллинга с обработкой ошибок"""
@@ -125,16 +134,33 @@ async def run_polling():
         except (NetworkError, TimedOut) as e:
             retry_count += 1
             delay = min(base_delay * (2 ** retry_count), 300)  # максимальная задержка 5 минут
-            logger.warning(f"Сетевая ошибка при поллинге (попытка {retry_count}/{max_retries}): {str(e)}")
-            logger.warning(f"Детали ошибки: {type(e).__name__}: {str(e)}")
+            
+            error_details = {
+                'error_type': type(e).__name__,
+                'error_msg': str(e),
+                'retry_count': retry_count,
+                'max_retries': max_retries,
+                'next_delay': delay
+            }
+            
+            logger.warning(
+                "Сетевая ошибка при поллинге: %(error_type)s - %(error_msg)s "
+                "(попытка %(retry_count)s/%(max_retries)s, "
+                "следующая попытка через %(next_delay)s сек)",
+                error_details
+            )
+            
             if retry_count >= max_retries:
                 logger.error("Превышено максимальное количество попыток переподключения")
                 raise
-            logger.info(f"Повторная попытка через {delay} секунд...")
+                
             await asyncio.sleep(delay)
         except Exception as e:
-            logger.error(f"Неожиданная ошибка при поллинге: {type(e).__name__}: {str(e)}")
-            logger.error(f"Traceback: {traceback.format_exc()}")
+            logger.error(
+                f"Критическая ошибка при поллинге: {type(e).__name__} - {str(e)}\n"
+                f"Traceback: {traceback.format_exc()}"
+            )
+            # Добавляем небольшую задержку перед следующей попыткой
             await asyncio.sleep(5)
 
 async def main():
@@ -152,8 +178,8 @@ async def main():
         
         # Запускаем планировщик парсинга в фоновом режиме
         logger.info("Запуск планировщика парсинга...")
-        asyncio.create_task(scheduler.start())
-        logger.info("Планировщик парсинга успешно запущен")
+        scheduler_task = asyncio.create_task(scheduler.start())
+        logger.info("Планировщик парсинга запущен успешно")
         
         # Запускаем бота
         logger.info("Инициализация приложения бота...")
@@ -168,9 +194,25 @@ async def main():
         await run_polling()
         
     except Exception as e:
-        logger.error(f"Критическая ошибка в main(): {type(e).__name__}: {str(e)}")
+        logger.error(f"Критическая ошибка в main(): {type(e).__name__} - {str(e)}")
         logger.error(f"Traceback: {traceback.format_exc()}")
         raise
+    finally:
+        # Безопасное завершение работы
+        try:
+            if scheduler.is_running:
+                logger.info("Остановка планировщика...")
+                await scheduler.stop()
+                logger.info("Планировщик успешно остановлен")
+            
+            logger.info("Остановка приложения бота...")
+            await application.stop()
+            await application.shutdown()
+            logger.info("Приложение бота успешно остановлено")
+            
+        except Exception as e:
+            logger.error(f"Ошибка при завершении работы: {type(e).__name__} - {str(e)}")
+            logger.error(f"Traceback: {traceback.format_exc()}")
 
 # Run bot
 if __name__ == "__main__":
@@ -180,7 +222,7 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         logger.info("Бот остановлен пользователем")
     except Exception as e:
-        logger.error(f"Критическая ошибка при работе бота: {type(e).__name__}: {str(e)}")
+        logger.error(f"Критическая ошибка при работе бота: {type(e).__name__} - {str(e)}")
         logger.error(f"Traceback: {traceback.format_exc()}")
     finally:
         # Останавливаем планировщик при выходе
@@ -194,5 +236,5 @@ if __name__ == "__main__":
                 new_loop.close()
                 logger.info("Планировщик успешно остановлен")
             except Exception as e:
-                logger.error(f"Ошибка при остановке планировщика: {type(e).__name__}: {str(e)}")
+                logger.error(f"Ошибка при остановке планировщика: {type(e).__name__} - {str(e)}")
                 logger.error(f"Traceback: {traceback.format_exc()}")
