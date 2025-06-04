@@ -12,10 +12,11 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMa
 
 async def handle_message(update, context):
     text = update.message.text.strip()
-    logger.info(f"Received message: {text}")
+    user_id = update.effective_user.id
+    logger.info(f"Получено сообщение от пользователя {user_id}: {text}")
 
     if text == '🏠 Главное меню':
-        logger.info("Нажата кнопка '🏠 Главное меню'")
+        logger.info(f"Нажата кнопка '🏠 Главное меню' пользователем {user_id}")
         context.user_data.clear()
         await update.message.reply_text(
             "Вы вернулись в главное меню! Выберите опцию:",
@@ -471,7 +472,7 @@ async def handle_message(update, context):
             )
         except Exception as e:
             context.user_data.pop('superadmin_registration_in_progress', None)
-            logger.error(f"Ошибка при добавлении пользователя суперадмином: {e}")
+            logger.error(f"Ошибка при добавлении пользователя суперадмином (user_id: {update.effective_user.id}): {e}")
             await update.message.reply_text(
                 "Произошла ошибка при добавлении пользователя.",
                 reply_markup=REPLY_KEYBOARD_MARKUP
@@ -494,7 +495,8 @@ async def handle_inline_buttons(update, context):
         logger.error("No callback_data received")
         return
 
-    logger.info(f"Inline button pressed: {callback_data}")
+    user_id = update.effective_user.id
+    logger.info(f"Нажата inline кнопка {callback_data} пользователем {user_id}")
     telegram_id = str(update.effective_user.id)
 
     # --- Вытаскиваем is_superadmin ---
@@ -566,7 +568,7 @@ async def handle_inline_buttons(update, context):
                 reply_markup=InlineKeyboardMarkup(keyboard)
             )
         except Exception as e:
-            logger.error(f"Database error in group handler: {e}")
+            logger.error(f"Database error in group handler (user_id: {update.effective_user.id}): {e}")
             await query.message.reply_text("Произошла ошибка при обработке запроса.\n\nВы можете вернуться в главное меню командой /cancel.")
         finally:
             conn.close()
@@ -616,7 +618,7 @@ async def handle_inline_buttons(update, context):
                 reply_markup=InlineKeyboardMarkup(keyboard)
             )
         except Exception as e:
-            logger.error(f"Database error in disciplines handler: {e}")
+            logger.error(f"Database error in disciplines handler (user_id: {update.effective_user.id}): {e}")
             await query.message.reply_text("Произошла ошибка при обработке запроса.\n\nВы можете вернуться в главное меню командой /cancel.")
         finally:
             conn.close()
@@ -711,7 +713,7 @@ async def handle_inline_buttons(update, context):
                         reply_markup=REPLY_KEYBOARD_MARKUP
                     )
             except Exception as e:
-                logger.error(f"Error displaying discipline ratings: {e}")
+                logger.error(f"Error displaying discipline ratings (user_id: {update.effective_user.id}): {e}")
                 await query.message.reply_text("Произошла ошибка при получении данных.\n\nВы можете вернуться в главное меню командой /cancel.")
             finally:
                 if conn:
@@ -769,7 +771,7 @@ async def handle_inline_buttons(update, context):
                 reply_markup=InlineKeyboardMarkup(buttons)
             )
         except Exception as e:
-            logger.error(f"Ошибка при получении курсовых работ: {e}")
+            logger.error(f"Ошибка при получении курсовых работ (user_id: {update.effective_user.id}): {e}")
             await query.message.reply_text(
                 "Произошла ошибка при получении курсовых работ.",
                 reply_markup=REPLY_KEYBOARD_MARKUP
@@ -848,7 +850,7 @@ async def handle_inline_buttons(update, context):
                     except Exception as e:
                         logger.warning(f"Не удалось удалить временный архив: {e}")
         except Exception as e:
-            logger.error(f"Ошибка при создании архива: {e}")
+            logger.error(f"Ошибка при создании архива (user_id: {update.effective_user.id}): {e}")
             await query.message.reply_text(
                 "Ошибка при создании архива.",
                 reply_markup=REPLY_KEYBOARD_MARKUP
@@ -892,7 +894,7 @@ async def handle_inline_buttons(update, context):
             else:
                 profile_text = "Профиль не найден. Зарегистрируйтесь через кнопку Мой Профиль."
         except Exception as e:
-            logger.error(f"Ошибка при получении профиля: {e}")
+            logger.error(f"Ошибка при получении профиля (user_id: {update.effective_user.id}): {e}")
             profile_text = "Ошибка при получении профиля."
         finally:
             conn.close()
