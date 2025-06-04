@@ -883,13 +883,14 @@ async def handle_inline_buttons(update, context):
                     "TG: <a href='https://t.me/bycard1'>@bycard1</a>\n"
                 )
                 profile_text = (
+                    f"📚 Сайт Бота: <a href='https://6fcag3vsaoag.github.io/brumarks/'>6fcag3vsaoag.github.io</a>\n\n\n"
                     f"<b>Ваш профиль</b>\n"
                     f"Name: {name}\n"
                     f"Group: {group}\n"
                     f"Student_ID: {student_id_val}\n"
                     f"Status: {status}"
                     f"{admin_info}"
-                    f"{admin_help_block}"
+                    f"{admin_help_block}\n\n"
                 )
             else:
                 profile_text = "Профиль не найден. Зарегистрируйтесь через кнопку Мой Профиль."
