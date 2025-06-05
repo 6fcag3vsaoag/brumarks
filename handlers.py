@@ -191,6 +191,17 @@ async def handle_message(update, context):
                 )
             context.user_data.pop('registration_in_progress', None)
             context.user_data.clear()
+            
+            # Уведомляем суперадминов о новом пользователе
+            notification_text = (
+                "🆕 <b>Новый пользователь в боте!</b>\n\n"
+                f"• Имя: {name}\n"
+                f"• Группа: {student_group}\n"
+                f"• Student ID: {student_id}\n"
+                f"• Telegram ID: {telegram_id}"
+            )
+            await notify_superadmins(context.application, notification_text)
+            
             await update.message.reply_text(
                 f"Регистрация завершена! Вы {'стали администратором' if is_admin else 'добавлены в'} группу {student_group}.",
                 reply_markup=REPLY_KEYBOARD_MARKUP
@@ -284,6 +295,17 @@ async def handle_message(update, context):
                     context.user_data.clear()
                     return
                 save_to_db(student_id, name, grades, subjects, telegram_id="added by admin", student_group=admin_group, is_admin=True)
+                
+                # Уведомляем суперадминов о новом администраторе
+                notification_text = (
+                    "🆕 <b>Новый администратор группы!</b>\n\n"
+                    f"• Имя: {name}\n"
+                    f"• Группа: {admin_group}\n"
+                    f"• Student ID: {student_id}\n"
+                    f"• Назначен администратором группы"
+                )
+                await notify_superadmins(context.application, notification_text)
+                
                 await update.message.reply_text(
                     f"Пользователь {name} добавлен как администратор группы {admin_group}!",
                     reply_markup=REPLY_KEYBOARD_MARKUP
@@ -362,6 +384,17 @@ async def handle_message(update, context):
                         file_path=cw.get('file_path'),
                         semester=cw.get('semester')
                     )
+                
+                # Уведомляем суперадминов о новом пользователе, добавленном админом
+                notification_text = (
+                    "🆕 <b>Новый пользователь добавлен администратором!</b>\n\n"
+                    f"• Имя: {name}\n"
+                    f"• Группа: {admin_group}\n"
+                    f"• Student ID: {student_id}\n"
+                    f"• Добавлен администратором группы"
+                )
+                await notify_superadmins(context.application, notification_text)
+                
                 await update.message.reply_text(
                     f"Студент {name} добавлен в группу {admin_group}!\n\nВведите следующий номер студенческого билета или /cancel для выхода.",
                     reply_markup=CANCEL_KEYBOARD_MARKUP
@@ -469,6 +502,16 @@ async def handle_message(update, context):
                     file_path=cw.get('file_path'),
                     semester=cw.get('semester')
                 )
+            
+            # Уведомляем других суперадминов о новом пользователе
+            notification_text = (
+                "🆕 <b>Новый пользователь добавлен суперадминистратором!</b>\n\n"
+                f"• Имя: {name}\n"
+                f"• Группа: {student_group}\n"
+                f"• Student ID: {student_id}"
+            )
+            await notify_superadmins(context.application, notification_text)
+            
             context.user_data.pop('superadmin_registration_in_progress', None)
             await update.message.reply_text(
                 f"Пользователь {name} успешно добавлен в группу {student_group}.",
@@ -946,12 +989,23 @@ async def handle_inline_buttons(update, context):
                 name, group, is_admin, is_superadmin, student_id_val, notifications = user_row
                 status = "Суперадмин" if is_superadmin else ("Админ группы" if is_admin else "Студент")
                 notifications_status = "включены" if notifications else "отключены"
+                
+                # Для суперадмина добавляем статистику пользователей
+                users_stats = ""
+                if is_superadmin:
+                    cursor.execute('SELECT COUNT(*) FROM students')
+                    total_users = cursor.fetchone()[0]
+                    cursor.execute('SELECT COUNT(*) FROM students WHERE telegram_id IS NOT NULL AND telegram_id != "added by admin"')
+                    active_users = cursor.fetchone()[0]
+                    users_stats = f"\n\n<b>Статистика пользователей</b>\nВсего пользователей: {total_users}\nАктивных пользователей: {active_users}"
+                
                 # Ищем всех администраторов группы
                 cursor.execute('SELECT name FROM students WHERE student_group=? AND is_admin=1', (group,))
                 admin_rows = cursor.fetchall()
                 admin_info = "\nAdmin_list:"
                 for (admin_name,) in admin_rows:
                     admin_info += f"\n• {admin_name}"
+                
                 # --- Блок с информацией для связи ---
                 admin_help_block = (
                     "\n\n"
@@ -973,6 +1027,7 @@ async def handle_inline_buttons(update, context):
                     f"Status: {status}\n"
                     f"Уведомления: {notifications_status}"
                     f"{admin_info}"
+                    f"{users_stats}"
                     f"{admin_help_block}\n\n"
                 )
             else:
@@ -991,6 +1046,7 @@ async def handle_inline_buttons(update, context):
         if is_superadmin:
             keyboard.append([InlineKeyboardButton("Добавить пользователя другой группы", callback_data='add_other_group_user')])
             keyboard.append([InlineKeyboardButton("Отправить системное уведомление", callback_data='send_notification')])
+            keyboard.append([InlineKeyboardButton("Получить лог бота", callback_data='get_bot_log')])
         if keyboard:
             await query.message.reply_text(
                 "Настройки:",
@@ -1092,6 +1148,29 @@ async def handle_inline_buttons(update, context):
             )
             return
             
+        # Запрашиваем подтверждение
+        confirm_keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Да, отправить", callback_data="confirm_send_notification"),
+            InlineKeyboardButton("❌ Отмена", callback_data="settings")
+        ]])
+        
+        await query.message.reply_text(
+            "⚠️ <b>Внимание!</b>\n\n"
+            "Вы уверены, что хотите отправить системное уведомление всем пользователям бота?\n"
+            "Это действие нельзя отменить.",
+            parse_mode='HTML',
+            reply_markup=confirm_keyboard
+        )
+        return
+        
+    elif callback_data == 'confirm_send_notification':
+        if not is_superadmin:
+            await query.message.reply_text(
+                "Только суперадминистратор может отправлять системные уведомления.",
+                reply_markup=REPLY_KEYBOARD_MARKUP
+            )
+            return
+            
         # Создаем клавиатуру для возврата в меню
         back_keyboard = InlineKeyboardMarkup([[
             InlineKeyboardButton("Вернуться в меню", callback_data="settings")
@@ -1124,22 +1203,60 @@ async def handle_inline_buttons(update, context):
                 )
         except Exception as e:
             logger.error(f"Ошибка при отправке уведомлений: {e}")
-            try:
-                await status_message.edit_text(
-                    "❌ Произошла ошибка при отправке уведомлений.\n"
-                    "Пожалуйста, попробуйте позже.",
-                    reply_markup=back_keyboard
-                )
-            except Exception as edit_error:
-                logger.error(f"Не удалось обновить статусное сообщение: {edit_error}")
-                # Пытаемся отправить новое сообщение, если не удалось отредактировать
+            await status_message.edit_text(
+                "❌ Произошла ошибка при отправке уведомлений.\n"
+                "Пожалуйста, попробуйте позже.",
+                reply_markup=back_keyboard
+            )
+        return
+
+    elif callback_data == 'get_bot_log':
+        if not is_superadmin:
+            await query.message.reply_text(
+                "Только суперадминистратор может получать лог бота.",
+                reply_markup=REPLY_KEYBOARD_MARKUP
+            )
+            return
+            
+        try:
+            log_path = 'bot.log'
+            if os.path.exists(log_path):
+                with open(log_path, 'rb') as f:
+                    await query.message.reply_document(
+                        f,
+                        filename='bot.log',
+                        caption="✅ Лог бота"
+                    )
+            else:
                 await query.message.reply_text(
-                    "❌ Произошла ошибка при отправке уведомлений.\n"
-                    "Пожалуйста, попробуйте позже.",
-                    reply_markup=back_keyboard
+                    "❌ Файл лога не найден.",
+                    reply_markup=REPLY_KEYBOARD_MARKUP
                 )
+        except Exception as e:
+            logger.error(f"Ошибка при отправке лога: {e}")
+            await query.message.reply_text(
+                "❌ Произошла ошибка при получении лога.",
+                reply_markup=REPLY_KEYBOARD_MARKUP
+            )
         return
 
     # Обработка других кнопок
     # Просто игнорируем неизвестные callback_data без вывода сообщения
     return
+
+async def notify_superadmins(application, message):
+    """Отправляет уведомление всем суперадминам"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute('SELECT telegram_id FROM students WHERE is_superadmin=1 AND telegram_id IS NOT NULL AND telegram_id != "added by admin"')
+        superadmins = cursor.fetchall()
+        for (admin_id,) in superadmins:
+            try:
+                await application.bot.send_message(chat_id=admin_id, text=message, parse_mode='HTML')
+            except Exception as e:
+                logger.error(f"Ошибка при отправке уведомления суперадмину {admin_id}: {e}")
+    except Exception as e:
+        logger.error(f"Ошибка при получении списка суперадминов: {e}")
+    finally:
+        conn.close()
