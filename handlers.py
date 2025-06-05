@@ -7,7 +7,8 @@ import asyncio
 from utils import (
     logger, get_db_connection, check_registration, parse_student_data, save_to_db,
     show_student_rating, format_ratings_table, REPLY_KEYBOARD_MARKUP,
-    CANCEL_KEYBOARD_MARKUP, INLINE_KEYBOARD_MARKUP, validate_student_id, validate_group_format, validate_student_group, handle_telegram_timeout
+    CANCEL_KEYBOARD_MARKUP, INLINE_KEYBOARD_MARKUP, validate_student_id, validate_group_format, validate_student_group, handle_telegram_timeout,
+    send_notification_to_users
 )
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from archive_manager import CourseWorkArchiveManager
@@ -939,25 +940,29 @@ async def handle_inline_buttons(update, context):
         conn = get_db_connection()
         cursor = conn.cursor()
         try:
-            cursor.execute('SELECT name, student_group, is_admin, is_superadmin, student_id FROM students WHERE telegram_id=?', (telegram_id,))
+            cursor.execute('SELECT name, student_group, is_admin, is_superadmin, student_id, notifications FROM students WHERE telegram_id=?', (telegram_id,))
             user_row = cursor.fetchone()
             if user_row:
-                name, group, is_admin, is_superadmin, student_id_val = user_row
+                name, group, is_admin, is_superadmin, student_id_val, notifications = user_row
                 status = "Суперадмин" if is_superadmin else ("Админ группы" if is_admin else "Студент")
+                notifications_status = "включены" if notifications else "отключены"
                 # Ищем всех администраторов группы
                 cursor.execute('SELECT name FROM students WHERE student_group=? AND is_admin=1', (group,))
                 admin_rows = cursor.fetchall()
                 admin_info = "\nAdmin_list:"
                 for (admin_name,) in admin_rows:
                     admin_info += f"\n• {admin_name}"
-                # --- Блок с информацией для администраторов и желающих ими стать ---
+                # --- Блок с информацией для связи ---
                 admin_help_block = (
                     "\n\n"
-                    "<b>Возможности администратора:</b>\n"
-                    "Администратор может добавлять одногруппников в базу данных бота (даже без их ведома) для отслеживания и контроля общей успеваемости всей группы."
-                    "Если вы хотите стать администратором для своей группы, свяжитесь с:\n"
-                    "email: 6fcag3vsaoag@mail.ru\n"
-                    "TG: <a href='https://t.me/bycard1'>@bycard1</a>\n"
+                    "<b>Обратная связь</b>\n"
+                    "Если вы:\n"
+                    "• Нашли ошибку или баг в работе бота\n"
+                    "• Есть идеи и предложения по улучшению функционала\n"
+                    "• Хотите стать администратором своей группы\n\n"
+                    "Свяжитесь с нами:\n"
+                    "📧 Email: 6fcag3vsaoag@mail.ru\n"
+                    "📱 Telegram: <a href='https://t.me/bycard1'>@bycard1</a>\n"
                 )
                 profile_text = (
                     f"📚 Сайт Бота: <a href='https://6fcag3vsaoag.github.io/brumarks/'>6fcag3vsaoag.github.io</a>\n\n\n"
@@ -965,7 +970,8 @@ async def handle_inline_buttons(update, context):
                     f"Name: {name}\n"
                     f"Group: {group}\n"
                     f"Student_ID: {student_id_val}\n"
-                    f"Status: {status}"
+                    f"Status: {status}\n"
+                    f"Уведомления: {notifications_status}"
                     f"{admin_info}"
                     f"{admin_help_block}\n\n"
                 )
@@ -979,16 +985,62 @@ async def handle_inline_buttons(update, context):
         await query.message.reply_text(profile_text, parse_mode='HTML', reply_markup=REPLY_KEYBOARD_MARKUP)
         # Кнопки управления
         keyboard = []
+        keyboard.append([InlineKeyboardButton("Настройка системных уведомлений", callback_data='notification_settings')])
         if is_admin:
             keyboard.append([InlineKeyboardButton("Добавить админа", callback_data='add_admin')])
         if is_superadmin:
             keyboard.append([InlineKeyboardButton("Добавить пользователя другой группы", callback_data='add_other_group_user')])
+            keyboard.append([InlineKeyboardButton("Отправить системное уведомление", callback_data='send_notification')])
         if keyboard:
             await query.message.reply_text(
                 "Настройки:",
                 reply_markup=InlineKeyboardMarkup(keyboard)
             )
         return
+
+    elif callback_data == 'notification_settings':
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ Включить", callback_data='notifications_on'),
+                InlineKeyboardButton("❌ Отключить", callback_data='notifications_off')
+            ]
+        ])
+        await query.message.reply_text(
+            "🔔 Настройка уведомлений\n\n"
+            "Хотите ли вы получать уведомления о важных обновлениях функционала бота?\n\n"
+            "• Информация об улучшениях\n"
+            "• Уведомления о технических работах\n"
+            "• Важные объявления",
+            reply_markup=keyboard
+        )
+        return
+
+    elif callback_data in ['notifications_on', 'notifications_off']:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        try:
+            new_value = 1 if callback_data == 'notifications_on' else 0
+            cursor.execute('UPDATE students SET notifications=? WHERE telegram_id=?', (new_value, telegram_id))
+            conn.commit()
+            status = "включены" if new_value else "отключены"
+            back_keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton("Вернуться в профиль", callback_data="settings")
+            ]])
+            await query.message.reply_text(
+                f"✅ Настройки сохранены!\n"
+                f"Уведомления {status}.",
+                reply_markup=back_keyboard
+            )
+        except Exception as e:
+            logger.error(f"Ошибка при обновлении настроек уведомлений: {e}")
+            await query.message.reply_text(
+                "❌ Произошла ошибка при сохранении настроек.",
+                reply_markup=REPLY_KEYBOARD_MARKUP
+            )
+        finally:
+            conn.close()
+        return
+
     elif callback_data == 'add_other_group_user':
         if not is_superadmin:
             await query.message.reply_text(
@@ -1031,6 +1083,61 @@ async def handle_inline_buttons(update, context):
     elif callback_data.startswith('student_'):
         student_id = callback_data.split('_')[1]
         await show_student_rating(query, student_id)
+        return
+    elif callback_data == 'send_notification':
+        if not is_superadmin:
+            await query.message.reply_text(
+                "Только суперадминистратор может отправлять системные уведомления.",
+                reply_markup=REPLY_KEYBOARD_MARKUP
+            )
+            return
+            
+        # Создаем клавиатуру для возврата в меню
+        back_keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("Вернуться в меню", callback_data="settings")
+        ]])
+            
+        # Отправляем сообщение о начале процесса
+        status_message = await query.message.reply_text(
+            "⏳ Отправка уведомлений...\n"
+            "Пожалуйста, подождите.",
+            reply_markup=back_keyboard
+        )
+        
+        try:
+            success, success_count, fail_count = await send_notification_to_users(context.application)
+            if success:
+                total = success_count + fail_count
+                await status_message.edit_text(
+                    f"✅ Уведомления отправлены!\n\n"
+                    f"📊 Статистика:\n"
+                    f"• Успешно: {success_count}\n"
+                    f"• Не удалось: {fail_count}\n"
+                    f"• Всего получателей: {total}",
+                    reply_markup=back_keyboard
+                )
+            else:
+                await status_message.edit_text(
+                    "❌ Произошла ошибка при отправке уведомлений.\n"
+                    "Пожалуйста, попробуйте позже.",
+                    reply_markup=back_keyboard
+                )
+        except Exception as e:
+            logger.error(f"Ошибка при отправке уведомлений: {e}")
+            try:
+                await status_message.edit_text(
+                    "❌ Произошла ошибка при отправке уведомлений.\n"
+                    "Пожалуйста, попробуйте позже.",
+                    reply_markup=back_keyboard
+                )
+            except Exception as edit_error:
+                logger.error(f"Не удалось обновить статусное сообщение: {edit_error}")
+                # Пытаемся отправить новое сообщение, если не удалось отредактировать
+                await query.message.reply_text(
+                    "❌ Произошла ошибка при отправке уведомлений.\n"
+                    "Пожалуйста, попробуйте позже.",
+                    reply_markup=back_keyboard
+                )
         return
 
     # Обработка других кнопок

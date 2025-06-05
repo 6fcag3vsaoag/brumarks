@@ -87,7 +87,8 @@ def init_db():
                 is_admin INTEGER DEFAULT 0,
                 backup_telegram_ids TEXT DEFAULT '[]',
                 last_parsed_time TEXT,
-                is_superadmin INTEGER DEFAULT 0
+                is_superadmin INTEGER DEFAULT 0,
+                notifications INTEGER DEFAULT 1
             )
         ''')
         cursor.execute('''

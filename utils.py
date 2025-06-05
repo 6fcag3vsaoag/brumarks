@@ -361,7 +361,8 @@ def save_to_db(student_id, name, grades, subjects, telegram_id=None, student_gro
             'student_id': student_id,
             'name': name,
             'update_date': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-            'last_parsed_time': parse_time
+            'last_parsed_time': parse_time,
+            'notifications': 1  # Добавляем поле notifications со значением 1 по умолчанию
         }
         if telegram_id:
             data['telegram_id'] = telegram_id
@@ -584,3 +585,45 @@ async def safe_edit_message(message_obj, text, reply_markup=None, parse_mode=Non
     except Exception as e:
         logger.error(f"Ошибка при редактировании сообщения: {str(e)}")
         return None
+
+async def send_notification_to_users(application):
+    """
+    Отправляет системное уведомление всем пользователям, у которых notifications=1
+    """
+    try:
+        # Читаем текст уведомления
+        with open('notification.txt', 'r', encoding='utf-8') as f:
+            notification_text = f.read()
+
+        # Получаем список пользователей с включенными уведомлениями
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT telegram_id FROM students WHERE notifications=1 AND telegram_id IS NOT NULL AND telegram_id != "added by admin" AND telegram_id != "added_by_superadmin"')
+            users = cursor.fetchall()
+
+        # Отправляем уведомление каждому пользователю
+        success_count = 0
+        fail_count = 0
+        for (user_telegram_id,) in users:
+            try:
+                # Пропускаем невалидные telegram_id
+                if not user_telegram_id.isdigit():
+                    continue
+
+                await application.bot.send_message(
+                    chat_id=int(user_telegram_id),  # Преобразуем в число
+                    text=notification_text,
+                    parse_mode='HTML',
+                    disable_web_page_preview=True  # Отключаем предпросмотр ссылок
+                )
+                success_count += 1
+                await asyncio.sleep(0.1)  # Небольшая задержка между отправками
+            except Exception as e:
+                logger.error(f"Ошибка при отправке уведомления пользователю {user_telegram_id}: {e}")
+                fail_count += 1
+                continue  # Продолжаем со следующим пользователем
+
+        return True, success_count, fail_count
+    except Exception as e:
+        logger.error(f"Ошибка при отправке уведомлений: {e}")
+        return False, 0, 0
