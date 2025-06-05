@@ -2,6 +2,7 @@ config.json
 students.db
 .idea/
 course_works/
+course_work_archives/
 __pycache__/
 bot.log
 students — копия.db

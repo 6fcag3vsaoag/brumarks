@@ -1,15 +1,18 @@
 import re
 import os
+import json
 import zipfile
 import tempfile
 import asyncio
 from utils import (
     logger, get_db_connection, check_registration, parse_student_data, save_to_db,
     show_student_rating, format_ratings_table, REPLY_KEYBOARD_MARKUP,
-    CANCEL_KEYBOARD_MARKUP, INLINE_KEYBOARD_MARKUP, validate_student_id, validate_group_format, validate_student_group
+    CANCEL_KEYBOARD_MARKUP, INLINE_KEYBOARD_MARKUP, validate_student_id, validate_group_format, validate_student_group, handle_telegram_timeout
 )
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
+from archive_manager import CourseWorkArchiveManager
 
+@handle_telegram_timeout()
 async def handle_message(update, context):
     text = update.message.text.strip()
     user_id = update.effective_user.id
@@ -483,6 +486,7 @@ async def handle_message(update, context):
     # Убираем универсальное сообщение 'Пожалуйста, используйте кнопки меню...'
     return
 
+@handle_telegram_timeout()
 async def handle_inline_buttons(update, context):
     query = update.callback_query
     if not query:
@@ -812,6 +816,7 @@ async def handle_inline_buttons(update, context):
         logger.info(f"getcwzip_: discipline_key={discipline_key}")
         discipline_name = context.user_data.get('discipline_map', {}).get(discipline_key)
         logger.info(f"getcwzip_: discipline_name={discipline_name}")
+        
         if not discipline_name:
             logger.error(f"getcwzip_: Не найдено название дисциплины по ключу {discipline_key}. discipline_map={context.user_data.get('discipline_map', {})}")
             await query.message.reply_text(
@@ -819,44 +824,116 @@ async def handle_inline_buttons(update, context):
                 reply_markup=REPLY_KEYBOARD_MARKUP
             )
             return
-        conn = get_db_connection()
-        cursor = conn.cursor()
+
+        # Отправляем сообщение о начале процесса
+        status_message = await query.message.reply_text(
+            "⏳ Подготовка архива курсовых работ...\n"
+            "Пожалуйста, подождите и не нажимайте другие кнопки."
+        )
+
         try:
-            cursor.execute('SELECT file_path FROM course_works WHERE TRIM(LOWER(discipline))=TRIM(LOWER(?))', (discipline_name,))
-            files = [os.path.normpath(row[0]) for row in cursor.fetchall() if row[0] and os.path.isfile(os.path.normpath(row[0]))]
-            logger.info(f"getcwzip_: найдено файлов для архивации: {files}")
-            if not files:
-                await query.message.reply_text(
-                    "Нет файлов для архивации.",
-                    reply_markup=REPLY_KEYBOARD_MARKUP
-                )
+            # Инициализируем менеджер архивов
+            archive_manager = CourseWorkArchiveManager()
+            
+            # Получаем или создаем архив
+            archive_paths, is_updated, info_message = await archive_manager.get_or_create_archive(discipline_name)
+            
+            if not archive_paths:
+                await status_message.edit_text(info_message, reply_markup=REPLY_KEYBOARD_MARKUP)
                 return
-            with tempfile.NamedTemporaryFile(delete=False, suffix='.zip') as tmp_zip:
-                zip_path = tmp_zip.name
-            try:
-                with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-                    for file in files:
-                        arcname = os.path.basename(file)
-                        logger.info(f"getcwzip_: добавление в архив {file} как {arcname}")
-                        zipf.write(file, arcname=arcname)
-                with open(zip_path, 'rb') as f:
-                    logger.info(f"getcwzip_: отправка архива {zip_path}")
-                    await query.message.reply_document(f, filename=f'courseworks_{discipline_key}.zip')
-            finally:
-                if os.path.exists(zip_path):
+
+            # Получаем все части архива из базы данных
+            with get_db_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('SELECT archive_parts FROM course_work_archives WHERE discipline=?', (discipline_name,))
+                result = cursor.fetchone()
+                if result and result[0]:
                     try:
-                        os.remove(zip_path)
-                        logger.info(f"getcwzip_: временный архив {zip_path} удалён")
-                    except Exception as e:
-                        logger.warning(f"Не удалось удалить временный архив: {e}")
+                        archive_paths = json.loads(result[0])
+                    except json.JSONDecodeError:
+                        logger.error(f"Ошибка при декодировании JSON для archive_parts: {result[0]}")
+                        archive_paths = []
+
+            # Обновляем статус
+            total_parts = len(archive_paths)
+            if total_parts > 1:
+                await status_message.edit_text(
+                    f"{info_message}\n"
+                    "📤 Загрузка архивов в Telegram..."
+                )
+            else:
+                await status_message.edit_text(
+                    f"{info_message}\n"
+                    "📤 Загрузка архива в Telegram..."
+                )
+
+            # Проверяем размер каждого архива перед отправкой
+            for i, archive_path in enumerate(archive_paths, 1):
+                if not os.path.exists(archive_path):
+                    logger.error(f"Файл архива не найден: {archive_path}")
+                    continue
+
+                file_size = os.path.getsize(archive_path)
+                if file_size > 50 * 1024 * 1024:  # 50MB
+                    logger.error(f"Архив {archive_path} превышает лимит Telegram (размер: {file_size/1024/1024:.2f}MB)")
+                    continue
+
+                if total_parts > 1:
+                    await status_message.edit_text(
+                        f"{info_message}\n"
+                        f"📤 Загрузка части {i} из {total_parts}..."
+                    )
+                    logger.info(f"Начинаем отправку части {i} из {total_parts} для дисциплины '{discipline_name}'")
+
+                try:
+                    with open(archive_path, 'rb') as f:
+                        filename = os.path.basename(archive_path)
+                        caption = "✅ Архив курсовых работ успешно загружен!"
+                        if total_parts > 1:
+                            caption = f"✅ Часть {i} из {total_parts} архива курсовых работ"
+                        logger.info(f"Отправка файла {filename} (часть {i} из {total_parts})")
+                        await query.message.reply_document(
+                            f,
+                            filename=filename,
+                            caption=caption
+                        )
+                        logger.info(f"Успешно отправлен файл {filename} (часть {i} из {total_parts})")
+                        # Небольшая пауза между отправкой частей
+                        if i < total_parts:
+                            await asyncio.sleep(1)
+                except Exception as e:
+                    logger.error(f"Ошибка при отправке архива {archive_path}: {e}")
+                    if "Request Entity Too Large" in str(e):
+                        await query.message.reply_text(
+                            f"❌ Часть {i} архива слишком большая для отправки через Telegram.\n"
+                            "Пожалуйста, обратитесь к администратору."
+                        )
+                    continue
+            
+            # Если было несколько частей, отправляем итоговое сообщение
+            if total_parts > 1:
+                logger.info(f"Все части архива для '{discipline_name}' успешно отправлены")
+                await query.message.reply_text(
+                    "✅ Все доступные части архива успешно загружены!\n"
+                    "📝 Для распаковки скачайте все части и используйте архиватор."
+                )
+
+            # Удаляем статусное сообщение
+            await status_message.delete()
+
         except Exception as e:
-            logger.error(f"Ошибка при создании архива (user_id: {update.effective_user.id}): {e}")
-            await query.message.reply_text(
-                "Ошибка при создании архива.",
+            logger.error(f"Ошибка при работе с архивом курсовых работ (user_id: {update.effective_user.id}): {e}")
+            error_message = "❌ Произошла ошибка при подготовке архива."
+            if "Request Entity Too Large" in str(e):
+                error_message = (
+                    "❌ Архив слишком большой для отправки через Telegram.\n"
+                    "Пожалуйста, попробуйте скачать работы по отдельности."
+                )
+            await status_message.edit_text(
+                error_message,
                 reply_markup=REPLY_KEYBOARD_MARKUP
             )
-        finally:
-            conn.close()
+
     elif callback_data == 'settings':
         # Получаем подробную информацию о пользователе
         conn = get_db_connection()

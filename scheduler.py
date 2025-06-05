@@ -2,6 +2,7 @@ import asyncio
 import datetime
 from utils import get_db_connection, parse_student_data, save_to_db, logger
 from telegram.ext import Application
+from archive_manager import CourseWorkArchiveManager
 
 class StudentParserScheduler:
     def __init__(self, application: Application):
@@ -9,6 +10,7 @@ class StudentParserScheduler:
         self.parsing_queue = asyncio.Queue()
         self.is_running = False
         self.parser_task = None
+        self.archive_manager = CourseWorkArchiveManager()
 
     async def start(self):
         """Запускает планировщик парсинга"""
@@ -28,6 +30,41 @@ class StudentParserScheduler:
                 except asyncio.CancelledError:
                     pass
 
+    def _get_all_disciplines(self):
+        """Получает список всех уникальных дисциплин из базы данных"""
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT DISTINCT discipline FROM course_works')
+            return [row[0] for row in cursor.fetchall() if row[0]]
+
+    async def _update_course_work_archives(self):
+        """Обновляет архивы курсовых работ"""
+        try:
+            disciplines = self._get_all_disciplines()
+            logger.info(f"Начало обновления архивов курсовых работ. Найдено {len(disciplines)} дисциплин")
+
+            for discipline in disciplines:
+                try:
+                    logger.info(f"Обновление архива для дисциплины: {discipline}")
+                    archive_paths, is_updated, info_message = await self.archive_manager.get_or_create_archive(
+                        discipline,
+                        force_update=True  # Принудительно обновляем архивы
+                    )
+                    if archive_paths:
+                        logger.info(f"Архив для дисциплины {discipline} успешно обновлен: {info_message}")
+                    else:
+                        logger.warning(f"Не удалось создать архив для дисциплины {discipline}: {info_message}")
+                except Exception as e:
+                    logger.error(f"Ошибка при обновлении архива для дисциплины {discipline}: {e}")
+                    continue
+
+                # Небольшая пауза между обработкой дисциплин
+                await asyncio.sleep(1)
+
+            logger.info("Завершено обновление архивов курсовых работ")
+        except Exception as e:
+            logger.error(f"Ошибка при обновлении архивов курсовых работ: {e}")
+
     async def _schedule_parser(self):
         """Планирует парсинг студентов каждые 2 часа"""
         while self.is_running:
@@ -45,9 +82,20 @@ class StudentParserScheduler:
                     ''', (current_time - datetime.timedelta(hours=2),))
                     students = cursor.fetchall()
 
-                # Добавляем студентов в очередь
-                for student in students:
-                    await self.parsing_queue.put(student)
+                if students:
+                    logger.info(f"Найдено {len(students)} студентов для обновления")
+                    # Добавляем студентов в очередь
+                    for student in students:
+                        await self.parsing_queue.put(student)
+
+                    # Ждем завершения обработки всех студентов
+                    await self.parsing_queue.join()
+                    
+                    # После обновления данных студентов обновляем архивы
+                    logger.info("Начало обновления архивов после обновления данных студентов")
+                    await self._update_course_work_archives()
+                else:
+                    logger.info("Нет студентов для обновления")
 
                 # Ждем 2 часа перед следующей проверкой
                 await asyncio.sleep(2 * 60 * 60)  # 2 часа в секундах

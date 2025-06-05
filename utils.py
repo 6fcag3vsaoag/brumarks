@@ -9,6 +9,10 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMa
 import re
 from functools import wraps
 import asyncio
+import functools
+from telegram.error import TimedOut, NetworkError
+import random
+import traceback
 
 # Logging configuration
 console_handler = logging.StreamHandler()
@@ -474,3 +478,109 @@ async def show_student_rating(update, student_id):
             await update.reply_text("Произошла ошибка при получении данных.")
     finally:
         conn.close()
+
+async def retry_on_timeout(func, max_retries=3, base_delay=1):
+    """Повторяет выполнение функции при таймауте с экспоненциальной задержкой и случайностью"""
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            return await func()
+        except (TimedOut, NetworkError) as e:
+            last_error = e
+            if attempt == max_retries - 1:
+                raise last_error
+            
+            # Экспоненциальная задержка с случайным компонентом
+            delay = base_delay * (2 ** attempt)
+            jitter = random.uniform(0, min(delay * 0.1, 1.0))  # 10% случайности, но не больше 1 секунды
+            total_delay = delay + jitter
+            
+            logger.warning(
+                f"Таймаут при выполнении {func.__name__}, "
+                f"попытка {attempt + 1}/{max_retries}. "
+                f"Ошибка: {str(e)}. "
+                f"Следующая попытка через {total_delay:.1f} сек"
+            )
+            await asyncio.sleep(total_delay)
+    
+    # Этот код не должен выполниться, но на всякий случай
+    if last_error:
+        raise last_error
+    raise RuntimeError("Unexpected error in retry_on_timeout")
+
+def handle_telegram_timeout(max_retries=5, base_delay=2):
+    """Декоратор для обработки таймаутов в командах и обработчиках"""
+    def decorator(func):
+        @functools.wraps(func)
+        async def wrapper(update, context, *args, **kwargs):
+            async def attempt():
+                return await func(update, context, *args, **kwargs)
+            try:
+                return await retry_on_timeout(attempt, max_retries, base_delay)
+            except (TimedOut, NetworkError) as e:
+                user_id = update.effective_user.id if update and update.effective_user else "Unknown"
+                logger.error(
+                    f"Ошибка при обработке запроса от пользователя {user_id}: "
+                    f"{type(e).__name__} - {str(e)}"
+                )
+                if update and hasattr(update, 'message') and update.message:
+                    try:
+                        await update.message.reply_text(
+                            "Извините, произошла ошибка при обработке запроса. "
+                            "Пожалуйста, попробуйте еще раз через несколько секунд."
+                        )
+                    except Exception as reply_error:
+                        logger.error(f"Не удалось отправить сообщение об ошибке: {reply_error}")
+                elif update and hasattr(update, 'callback_query') and update.callback_query:
+                    try:
+                        await update.callback_query.answer(
+                            "Произошла ошибка. Попробуйте еще раз.",
+                            show_alert=True
+                        )
+                    except Exception as answer_error:
+                        logger.error(f"Не удалось отправить ответ на callback: {answer_error}")
+                raise
+            except Exception as e:
+                user_id = update.effective_user.id if update and update.effective_user else "Unknown"
+                logger.error(
+                    f"Неожиданная ошибка при обработке запроса от пользователя {user_id}: "
+                    f"{type(e).__name__} - {str(e)}\n{traceback.format_exc()}"
+                )
+                raise
+        return wrapper
+    return decorator
+
+async def safe_send_message(message_obj, text, reply_markup=None, parse_mode=None):
+    """Безопасная отправка сообщения с обработкой таймаутов"""
+    async def send_attempt():
+        return await message_obj.reply_text(
+            text,
+            reply_markup=reply_markup,
+            parse_mode=parse_mode
+        )
+    try:
+        return await retry_on_timeout(send_attempt)
+    except Exception as e:
+        logger.error(f"Ошибка при отправке сообщения: {str(e)}")
+        # В случае критической ошибки пытаемся отправить упрощенное сообщение
+        try:
+            return await message_obj.reply_text(
+                "Произошла ошибка. Пожалуйста, попробуйте позже или используйте /menu для возврата в главное меню."
+            )
+        except:
+            logger.error("Не удалось отправить даже сообщение об ошибке")
+            return None
+
+async def safe_edit_message(message_obj, text, reply_markup=None, parse_mode=None):
+    """Безопасное редактирование сообщения с обработкой таймаутов"""
+    async def edit_attempt():
+        return await message_obj.edit_text(
+            text,
+            reply_markup=reply_markup,
+            parse_mode=parse_mode
+        )
+    try:
+        return await retry_on_timeout(edit_attempt)
+    except Exception as e:
+        logger.error(f"Ошибка при редактировании сообщения: {str(e)}")
+        return None

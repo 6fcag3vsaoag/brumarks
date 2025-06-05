@@ -3,7 +3,7 @@ from telegram import Update
 from telegram.error import NetworkError, TimedOut
 from utils import (
     logger, config, get_db_connection, require_registration, REPLY_KEYBOARD_MARKUP,
-    INLINE_KEYBOARD_MARKUP, format_ratings_table, show_student_rating
+    INLINE_KEYBOARD_MARKUP, format_ratings_table, show_student_rating, handle_telegram_timeout
 )
 from handlers import handle_message, handle_inline_buttons
 from scheduler import StudentParserScheduler
@@ -11,7 +11,37 @@ import asyncio
 import signal
 import traceback
 import sys
+import datetime
+import random
 
+# Константы для настройки повторных попыток и таймаутов
+RETRY_SETTINGS = {
+    'max_retries': 10,           # Увеличено с 5 до 10
+    'base_delay': 2,            # Уменьшено с 5 до 2 для более быстрых первых попыток
+    'max_delay': 600,           # Увеличено с 300 до 600 секунд
+    'connection_timeout': 60.0,  # Увеличено с 30 до 60 секунд
+    'read_timeout': 60.0,       # Увеличено с 30 до 60 секунд
+    'write_timeout': 60.0,      # Увеличено с 30 до 60 секунд
+    'connect_attempts': 5,      # Увеличено с 3 до 5
+    'polling_timeout': 30,      # Добавлен таймаут для поллинга
+    'webhook_max_connections': 40  # Добавлено максимальное количество одновременных подключений
+}
+
+# Создаем приложение с настроенными таймаутами
+def create_application():
+    return (Application.builder()
+            .token(config['telegram_token'])
+            .connect_timeout(RETRY_SETTINGS['connection_timeout'])
+            .read_timeout(RETRY_SETTINGS['read_timeout'])
+            .write_timeout(RETRY_SETTINGS['write_timeout'])
+            .get_updates_connect_timeout(RETRY_SETTINGS['connection_timeout'])
+            .get_updates_read_timeout(RETRY_SETTINGS['read_timeout'])
+            .get_updates_write_timeout(RETRY_SETTINGS['write_timeout'])
+            .pool_timeout(RETRY_SETTINGS['connection_timeout'])  # Добавлен таймаут пула
+            .connection_pool_size(RETRY_SETTINGS['webhook_max_connections'])  # Добавлен размер пула
+            .build())
+
+@handle_telegram_timeout()
 async def start_command(update, context):
     user_id = update.effective_user.id
     logger.info(f"Получена команда /start от пользователя {user_id}")
@@ -21,6 +51,7 @@ async def start_command(update, context):
         reply_markup=INLINE_KEYBOARD_MARKUP
     )
 
+@handle_telegram_timeout()
 async def cancel_command(update, context):
     user_id = update.effective_user.id
     logger.info(f"Получена команда /cancel от пользователя {user_id}")
@@ -30,6 +61,7 @@ async def cancel_command(update, context):
         reply_markup=INLINE_KEYBOARD_MARKUP
     )
 
+@handle_telegram_timeout()
 async def menu_command(update, context):
     user_id = update.effective_user.id
     logger.info(f"Получена команда /menu от пользователя {user_id}")
@@ -70,13 +102,22 @@ def init_db():
                 parsing_time TEXT
             )
         ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS course_work_archives (
+                discipline TEXT PRIMARY KEY,
+                archive_parts TEXT DEFAULT '[]',
+                last_updated TEXT NOT NULL,
+                file_count INTEGER DEFAULT 0,
+                total_size INTEGER DEFAULT 0
+            )
+        ''')
         conn.commit()
 
 # Initialize database
 init_db()
 
-# Bot setup
-application = Application.builder().token(config['telegram_token']).build()
+# Bot setup with timeouts
+application = create_application()
 
 # Initialize scheduler
 scheduler = StudentParserScheduler(application)
@@ -116,52 +157,116 @@ def handle_exception(loop, context):
         logger.error(f"Оригинальное сообщение: {context.get('message', 'Неизвестно')}")
         logger.error(f"Traceback: {traceback.format_exc()}")
 
-async def run_polling():
+async def run_polling(application):
     """Запуск поллинга с обработкой ошибок"""
     retry_count = 0
-    max_retries = 5
-    base_delay = 5  # начальная задержка в секундах
+    connect_attempt = 0
+    last_error_time = None
+    consecutive_errors = 0
+    last_success_time = asyncio.get_event_loop().time()
 
     while True:
         try:
             logger.info("Запуск поллинга бота...")
-            await application.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+            await application.updater.start_polling(
+                allowed_updates=Update.ALL_TYPES,
+                drop_pending_updates=True,  # Игнорируем сообщения, накопившиеся за время простоя
+                timeout=RETRY_SETTINGS['polling_timeout']
+            )
             logger.info("Поллинг успешно запущен")
-            # Если поллинг успешно запущен, сбрасываем счетчик попыток
+            
+            # Если поллинг успешно запущен, сбрасываем счетчики
             retry_count = 0
+            connect_attempt = 0
+            consecutive_errors = 0
+            last_error_time = None
+            last_success_time = asyncio.get_event_loop().time()
+            
             # Ждем бесконечно, пока не произойдет ошибка
             await asyncio.Event().wait()
+
         except (NetworkError, TimedOut) as e:
+            current_time = asyncio.get_event_loop().time()
+            consecutive_errors += 1
+            
+            # Проверяем, нужно ли полностью перезапустить бота
+            if consecutive_errors >= 10 or (current_time - last_success_time) > 1800:  # 30 минут без успешного подключения
+                logger.error(
+                    "Критическое количество ошибок или длительное отсутствие связи. "
+                    f"Последнее успешное подключение: {datetime.datetime.fromtimestamp(last_success_time)}"
+                )
+                # Полная остановка и перезапуск бота
+                try:
+                    await application.stop()
+                    await application.shutdown()
+                    logger.info("Бот успешно остановлен, подготовка к перезапуску...")
+                    await asyncio.sleep(10)  # Ждем 10 секунд перед перезапуском
+                    application = create_application()
+                    consecutive_errors = 0
+                    connect_attempt = 0
+                    retry_count = 0
+                    continue
+                except Exception as restart_error:
+                    logger.error(f"Ошибка при перезапуске бота: {restart_error}")
+                    await asyncio.sleep(30)  # Ждем 30 секунд перед следующей попыткой
+                    continue
+            
+            # Сбрасываем счетчик retry_count, если прошло достаточно времени с последней ошибки
+            if last_error_time and current_time - last_error_time > RETRY_SETTINGS['max_delay']:
+                retry_count = 0
+                connect_attempt = 0
+            
+            last_error_time = current_time
             retry_count += 1
-            delay = min(base_delay * (2 ** retry_count), 300)  # максимальная задержка 5 минут
+            connect_attempt += 1
+            
+            # Вычисляем задержку с экспоненциальным ростом и случайным компонентом
+            base_delay = RETRY_SETTINGS['base_delay'] * (2 ** retry_count)
+            jitter = random.uniform(0, min(base_delay * 0.1, 1.0))  # 10% случайности, но не больше 1 секунды
+            delay = min(base_delay + jitter, RETRY_SETTINGS['max_delay'])
             
             error_details = {
                 'error_type': type(e).__name__,
                 'error_msg': str(e),
                 'retry_count': retry_count,
-                'max_retries': max_retries,
-                'next_delay': delay
+                'connect_attempt': connect_attempt,
+                'consecutive_errors': consecutive_errors,
+                'next_delay': delay,
+                'time_since_last_success': int(current_time - last_success_time)
             }
+            
+            if connect_attempt >= RETRY_SETTINGS['connect_attempts']:
+                logger.error(
+                    "Превышено максимальное количество попыток подключения "
+                    "(%(connect_attempt)s/%(max_attempts)s). Перезапуск бота...",
+                    {'connect_attempt': connect_attempt, 'max_attempts': RETRY_SETTINGS['connect_attempts']}
+                )
+                # Перезапускаем приложение
+                await application.stop()
+                await application.shutdown()
+                application = create_application()
+                connect_attempt = 0
+                continue
             
             logger.warning(
                 "Сетевая ошибка при поллинге: %(error_type)s - %(error_msg)s "
-                "(попытка %(retry_count)s/%(max_retries)s, "
+                "(попытка %(retry_count)s, подключение %(connect_attempt)s/%(max_attempts)s, "
+                "последовательных ошибок: %(consecutive_errors)s, "
+                "время с последнего успеха: %(time_since_last_success)s сек, "
                 "следующая попытка через %(next_delay)s сек)",
-                error_details
+                {**error_details, 'max_attempts': RETRY_SETTINGS['connect_attempts']}
             )
             
-            if retry_count >= max_retries:
-                logger.error("Превышено максимальное количество попыток переподключения")
-                raise
-                
             await asyncio.sleep(delay)
+
         except Exception as e:
             logger.error(
                 f"Критическая ошибка при поллинге: {type(e).__name__} - {str(e)}\n"
                 f"Traceback: {traceback.format_exc()}"
             )
+            consecutive_errors += 1
             # Добавляем небольшую задержку перед следующей попыткой
-            await asyncio.sleep(5)
+            await asyncio.sleep(RETRY_SETTINGS['base_delay'] * (2 ** min(consecutive_errors, 5)))
 
 async def main():
     """Основная функция запуска бота"""
@@ -191,7 +296,7 @@ async def main():
         logger.info("Запуск поллинга...")
         
         # Запускаем поллинг с обработкой ошибок
-        await run_polling()
+        await run_polling(application)
         
     except Exception as e:
         logger.error(f"Критическая ошибка в main(): {type(e).__name__} - {str(e)}")
