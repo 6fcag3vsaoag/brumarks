@@ -1,6 +1,7 @@
 import re
 import os
 import json
+import base64
 import zipfile
 import tempfile
 import asyncio
@@ -12,6 +13,38 @@ from utils import (
 )
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from archive_manager import CourseWorkArchiveManager
+from datetime import datetime
+
+def encode_announcement_data(student_id, title, pub_time):
+    try:
+        # Берем только дату и время без миллисекунд для уменьшения размера
+        if isinstance(pub_time, str) and len(pub_time) > 19:
+            pub_time = pub_time[:19]
+        
+        # Создаем сокращенный формат данных
+        data = f"{student_id}:{title}:{pub_time}"
+        # Кодируем в base64 и убираем padding
+        encoded = base64.urlsafe_b64encode(data.encode()).decode().rstrip('=')
+        return encoded
+    except Exception as e:
+        logger.error(f"Ошибка при кодировании данных объявления: {e}")
+        return None
+
+def decode_announcement_data(encoded_data):
+    try:
+        # Добавляем padding обратно если нужно
+        padding = 4 - (len(encoded_data) % 4)
+        if padding != 4:
+            encoded_data += '=' * padding
+            
+        # Декодируем из base64
+        decoded = base64.urlsafe_b64decode(encoded_data).decode()
+        # Разбиваем строку на компоненты
+        student_id, title, pub_time = decoded.split(':', 2)
+        return student_id, title, pub_time
+    except Exception as e:
+        logger.error(f"Ошибка при декодировании данных объявления: {e}")
+        return None, None, None
 
 @handle_telegram_timeout()
 async def handle_message(update, context):
@@ -527,6 +560,121 @@ async def handle_message(update, context):
         context.user_data.clear()
         return
 
+    if context.user_data.get('awaiting_title'):
+        if len(text) > 50:
+            await update.message.reply_text(
+                "❌ Заголовок слишком длинный. Пожалуйста, сократите его до 50 символов.",
+                reply_markup=CANCEL_KEYBOARD_MARKUP
+            )
+            return
+        context.user_data['title'] = text
+        context.user_data['awaiting_title'] = False
+        context.user_data['awaiting_content'] = True
+        await update.message.reply_text(
+            "Введите текст объявления:\n\n"
+            "Вы можете отменить создание объявления командой /cancel",
+            reply_markup=CANCEL_KEYBOARD_MARKUP
+        )
+        return
+
+    if context.user_data.get('awaiting_content'):
+        context.user_data['content'] = text
+        context.user_data['awaiting_content'] = False
+        context.user_data['awaiting_contacts'] = True
+        await update.message.reply_text(
+            "Введите контактные данные (например, Telegram, email или телефон):\n\n"
+            "Вы можете отменить создание объявления командой /cancel",
+            reply_markup=CANCEL_KEYBOARD_MARKUP
+        )
+        return
+
+    if context.user_data.get('awaiting_contacts'):
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        try:
+            # Получаем student_id пользователя
+            cursor.execute('SELECT student_id FROM students WHERE telegram_id=?', (telegram_id,))
+            result = cursor.fetchone()
+            if not result:
+                await update.message.reply_text(
+                    "❌ Ошибка: пользователь не найден.",
+                    reply_markup=REPLY_KEYBOARD_MARKUP
+                )
+                context.user_data.clear()
+                return
+
+            student_id = result[0]
+            is_anon = context.user_data.get('announcement_type') == 'create_anon'
+            title = context.user_data.get('title')
+            content = context.user_data.get('content')
+            contacts = text
+
+            # Сохраняем объявление с текущим временем
+            current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            cursor.execute('''
+                INSERT INTO blackmarket (student_id, is_anon, title, content, contacts, publication_time)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (student_id, is_anon, title, content, contacts, current_time))
+            conn.commit()
+
+            # Отправляем уведомления пользователям
+            cursor.execute('''
+                SELECT telegram_id 
+                FROM students 
+                WHERE blackmarket_announcements = 1 
+                AND telegram_id IS NOT NULL 
+                AND telegram_id != ? 
+                AND telegram_id != "added by admin"
+                AND telegram_id != "added_by_superadmin"
+            ''', (telegram_id,))
+            users_to_notify = cursor.fetchall()
+
+            # Формируем текст уведомления
+            notification = (
+                "🆕 <b>Новое объявление в Black Market!</b>\n\n"
+                f"<b>{title}</b>\n\n"
+                f"{content[:100]}..." if len(content) > 100 else content
+            )
+
+            # Кодируем данные для callback
+            encoded_data = encode_announcement_data(student_id, title, current_time)
+
+            # Отправляем уведомления
+            for (user_telegram_id,) in users_to_notify:
+                try:
+                    keyboard = InlineKeyboardMarkup([[
+                        InlineKeyboardButton("👁 Посмотреть", callback_data=f'view_announcement_{encoded_data}')
+                    ]])
+                    await context.application.bot.send_message(
+                        chat_id=user_telegram_id,
+                        text=notification,
+                        parse_mode='HTML',
+                        reply_markup=keyboard
+                    )
+                except Exception as e:
+                    logger.error(f"Ошибка при отправке уведомления пользователю {user_telegram_id}: {e}")
+
+            # Возвращаем пользователя в меню черного рынка
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton("« Вернуться в Black Market", callback_data='black_market')
+            ]])
+            await update.message.reply_text(
+                "✅ Объявление успешно создано!",
+                reply_markup=keyboard
+            )
+            context.user_data.clear()
+
+        except Exception as e:
+            logger.error(f"Ошибка при создании объявления: {e}")
+            await update.message.reply_text(
+                "❌ Произошла ошибка при создании объявления.",
+                reply_markup=REPLY_KEYBOARD_MARKUP
+            )
+            context.user_data.clear()
+        finally:
+            conn.close()
+        return
+
     # Убираем универсальное сообщение 'Пожалуйста, используйте кнопки меню...'
     return
 
@@ -979,7 +1127,27 @@ async def handle_inline_buttons(update, context):
             )
 
     elif callback_data == 'settings':
-        # Получаем подробную информацию о пользователе
+        keyboard = []
+        keyboard.append([InlineKeyboardButton("ℹ️ Информация о профиле", callback_data='profile_info')])
+        keyboard.append([InlineKeyboardButton("🔔 Настройка уведомлений", callback_data='notifications_menu')])
+        keyboard.append([InlineKeyboardButton("🏪 Black Market", callback_data='black_market')])
+        
+        if is_admin:
+            keyboard.append([InlineKeyboardButton("👥 Добавить админа", callback_data='add_admin')])
+        
+        if is_superadmin:
+            keyboard.append([InlineKeyboardButton("➕ Добавить пользователя другой группы", callback_data='add_other_group_user')])
+            keyboard.append([InlineKeyboardButton("📢 Отправить системное уведомление", callback_data='send_notification')])
+            keyboard.append([InlineKeyboardButton("📋 Получить лог бота", callback_data='get_bot_log')])
+        
+        await query.message.reply_text(
+            "⚙️ Настройки\n"
+            "Выберите нужный пункт меню:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return
+
+    elif callback_data == 'profile_info':
         conn = get_db_connection()
         cursor = conn.cursor()
         try:
@@ -1032,63 +1200,72 @@ async def handle_inline_buttons(update, context):
                 )
             else:
                 profile_text = "Профиль не найден. Зарегистрируйтесь через кнопку Мой Профиль."
+
+            # Добавляем кнопку возврата
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton("« Назад", callback_data="settings")
+            ]])
+            
+            await query.message.reply_text(
+                profile_text,
+                parse_mode='HTML',
+                reply_markup=keyboard
+            )
         except Exception as e:
-            logger.error(f"Ошибка при получении профиля (user_id: {update.effective_user.id}): {e}")
-            profile_text = "Ошибка при получении профиля."
+            logger.error(f"Ошибка при получении профиля: {e}")
+            await query.message.reply_text(
+                "❌ Произошла ошибка при получении информации о профиле.",
+                reply_markup=REPLY_KEYBOARD_MARKUP
+            )
         finally:
             conn.close()
-        await query.message.reply_text(profile_text, parse_mode='HTML', reply_markup=REPLY_KEYBOARD_MARKUP)
-        # Кнопки управления
-        keyboard = []
-        keyboard.append([InlineKeyboardButton("Настройка системных уведомлений", callback_data='notification_settings')])
-        if is_admin:
-            keyboard.append([InlineKeyboardButton("Добавить админа", callback_data='add_admin')])
-        if is_superadmin:
-            keyboard.append([InlineKeyboardButton("Добавить пользователя другой группы", callback_data='add_other_group_user')])
-            keyboard.append([InlineKeyboardButton("Отправить системное уведомление", callback_data='send_notification')])
-            keyboard.append([InlineKeyboardButton("Получить лог бота", callback_data='get_bot_log')])
-        if keyboard:
-            await query.message.reply_text(
-                "Настройки:",
-                reply_markup=InlineKeyboardMarkup(keyboard)
-            )
         return
 
-    elif callback_data == 'notification_settings':
+    elif callback_data == 'notifications_menu':
         keyboard = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("✅ Включить", callback_data='notifications_on'),
-                InlineKeyboardButton("❌ Отключить", callback_data='notifications_off')
-            ]
+            [InlineKeyboardButton("Системные уведомления", callback_data='notification_settings')],
+            [InlineKeyboardButton("Уведомления Black Market", callback_data='blackmarket_notifications')],
+            [InlineKeyboardButton("« Назад", callback_data='settings')]
         ])
         await query.message.reply_text(
-            "🔔 Настройка уведомлений\n\n"
-            "Хотите ли вы получать уведомления о важных обновлениях функционала бота?\n\n"
-            "• Информация об улучшениях\n"
-            "• Уведомления о технических работах\n"
-            "• Важные объявления",
+            "🔔 Выберите тип уведомлений для настройки:",
             reply_markup=keyboard
         )
         return
 
-    elif callback_data in ['notifications_on', 'notifications_off']:
+    elif callback_data == 'blackmarket_notifications':
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ Включить", callback_data='blackmarket_notifications_on'),
+                InlineKeyboardButton("❌ Отключить", callback_data='blackmarket_notifications_off')
+            ],
+            [InlineKeyboardButton("« Назад", callback_data='notifications_menu')]
+        ])
+        await query.message.reply_text(
+            "🔔 Настройка уведомлений Black Market\n\n"
+            "Хотите ли вы получать уведомления о новых объявлениях?",
+            reply_markup=keyboard
+        )
+        return
+
+    elif callback_data in ['blackmarket_notifications_on', 'blackmarket_notifications_off']:
         conn = get_db_connection()
         cursor = conn.cursor()
         try:
-            new_value = 1 if callback_data == 'notifications_on' else 0
-            cursor.execute('UPDATE students SET notifications=? WHERE telegram_id=?', (new_value, telegram_id))
+            new_value = 1 if callback_data == 'blackmarket_notifications_on' else 0
+            cursor.execute('UPDATE students SET blackmarket_announcements=? WHERE telegram_id=?', (new_value, telegram_id))
             conn.commit()
             status = "включены" if new_value else "отключены"
             back_keyboard = InlineKeyboardMarkup([[
-                InlineKeyboardButton("Вернуться в профиль", callback_data="settings")
+                InlineKeyboardButton("« Назад", callback_data="notifications_menu")
             ]])
             await query.message.reply_text(
                 f"✅ Настройки сохранены!\n"
-                f"Уведомления {status}.",
+                f"Уведомления Black Market {status}.",
                 reply_markup=back_keyboard
             )
         except Exception as e:
-            logger.error(f"Ошибка при обновлении настроек уведомлений: {e}")
+            logger.error(f"Ошибка при обновлении настроек уведомлений Black Market: {e}")
             await query.message.reply_text(
                 "❌ Произошла ошибка при сохранении настроек.",
                 reply_markup=REPLY_KEYBOARD_MARKUP
@@ -1097,49 +1274,271 @@ async def handle_inline_buttons(update, context):
             conn.close()
         return
 
-    elif callback_data == 'add_other_group_user':
-        if not is_superadmin:
+    elif callback_data == 'black_market':
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        try:
+            # Получаем все активные объявления
+            cursor.execute('''
+                SELECT bm.id, bm.title 
+                FROM blackmarket bm 
+                ORDER BY bm.publication_time DESC
+            ''')
+            announcements = cursor.fetchall()
+            
+            keyboard = []
+            for announcement_id, title in announcements:
+                keyboard.append([InlineKeyboardButton(title, callback_data=f'view_{announcement_id}')])
+            
+            # Проверяем, может ли пользователь создавать объявления
+            cursor.execute('SELECT blackmarket_allowed FROM students WHERE telegram_id=?', (telegram_id,))
+            result = cursor.fetchone()
+            if result and result[0] == 1:
+                keyboard.append([InlineKeyboardButton("📝 Создать объявление", callback_data='create_announcement')])
+            
+            keyboard.append([InlineKeyboardButton("« Назад", callback_data='settings')])
+            
+            if not keyboard:  # Если нет объявлений и нет прав на создание
+                keyboard = [[InlineKeyboardButton("« Назад", callback_data='settings')]]
+                await query.message.reply_text(
+                    "🏪 Black Market\n\n"
+                    "В данный момент нет доступных объявлений.",
+                    reply_markup=InlineKeyboardMarkup(keyboard)
+                )
+            else:
+                await query.message.reply_text(
+                    "🏪 Black Market\n\n"
+                    "Здесь вы можете просмотреть актуальные объявления или создать своё.",
+                    reply_markup=InlineKeyboardMarkup(keyboard)
+                )
+        except Exception as e:
+            logger.error(f"Ошибка при открытии Black Market: {e}")
             await query.message.reply_text(
-                "Только суперадминистратор может добавлять пользователей в другие группы.",
+                "❌ Произошла ошибка при загрузке объявлений.",
                 reply_markup=REPLY_KEYBOARD_MARKUP
             )
-            return
-        await query.message.reply_text(
-            "Введите номер студенческого билета пользователя, которого хотите добавить в любую группу:\n\nВы можете отменить действие командой /cancel.",
-            reply_markup=CANCEL_KEYBOARD_MARKUP
-        )
-        context.user_data['awaiting_superadmin_student_id'] = True
+        finally:
+            conn.close()
         return
-    elif callback_data == 'add_admin':
-        if not is_registered or not is_admin:
+
+    elif callback_data.startswith('view_'):
+        try:
+            announcement_id = int(callback_data.split('_')[1])
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                SELECT bm.student_id, bm.is_anon, bm.title, bm.content, bm.contacts, bm.publication_time,
+                       s.name, s.student_group, s.telegram_id as author_telegram_id
+                FROM blackmarket bm 
+                JOIN students s ON bm.student_id = s.student_id 
+                WHERE bm.id = ?
+            ''', (announcement_id,))
+            announcement = cursor.fetchone()
+            
+            if not announcement:
+                await query.message.reply_text(
+                    "❌ Объявление не найдено.",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« Назад", callback_data='black_market')]])
+                )
+                return
+                
+            # Распаковываем данные
+            student_id, is_anon, title, content, contacts, pub_time, author_name, author_group, author_telegram_id = announcement
+            
+            # Формируем текст объявления
+            author_text = "🕵️ Анонимно" if is_anon else f"👤 {author_name} ({author_group})"
+            message_text = (
+                f"<b>{title}</b>\n\n"
+                f"Автор: {author_text}\n"
+                f"Контакты: {contacts}\n\n"
+                f"Содержание:\n{content}\n\n"
+                f"Опубликовано: {pub_time}"
+            )
+            
+            # Формируем клавиатуру
+            keyboard = []
+            
+            # Проверяем права на удаление
+            if telegram_id == author_telegram_id or is_superadmin:
+                if is_superadmin:
+                    keyboard.append([
+                        InlineKeyboardButton("🗑 Удалить", callback_data=f'del_{announcement_id}'),
+                        InlineKeyboardButton("⛔️ Удалить и заблокировать", callback_data=f'delblock_{announcement_id}')
+                    ])
+                else:
+                    keyboard.append([InlineKeyboardButton("🗑 Удалить", callback_data=f'del_{announcement_id}')])
+            
+            keyboard.append([InlineKeyboardButton("« Назад", callback_data='black_market')])
+            
             await query.message.reply_text(
-                "Только администратор группы может добавлять новых администраторов.",
+                message_text,
+                parse_mode='HTML',
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+        except Exception as e:
+            logger.error(f"Ошибка при просмотре объявления: {e}")
+            await query.message.reply_text(
+                "❌ Произошла ошибка при загрузке объявления.",
                 reply_markup=REPLY_KEYBOARD_MARKUP
             )
-            return
-        await query.message.reply_text(
-            "Введите номер студенческого билета нового администратора:\n\nВы можете отменить действие командой /cancel.",
-            reply_markup=CANCEL_KEYBOARD_MARKUP
-        )
-        context.user_data['awaiting_add_admin_id'] = True
+        finally:
+            if 'conn' in locals():
+                conn.close()
         return
-    elif callback_data == 'add_student':
-        if not is_admin:
+
+    elif callback_data.startswith('del_'):
+        if callback_data.startswith('delblock_'):
+            return
+        try:
+            announcement_id = int(callback_data.split('_')[1])
+            keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("✅ Да, удалить", callback_data=f'confirm_del_{announcement_id}'),
+                    InlineKeyboardButton("❌ Нет, отменить", callback_data=f'view_{announcement_id}')
+                ]
+            ])
             await query.message.reply_text(
-                "Только администратор группы может добавлять студентов.",
+                "⚠️ Вы уверены, что хотите удалить это объявление?",
+                reply_markup=keyboard
+            )
+        except Exception as e:
+            logger.error(f"Ошибка при подготовке удаления: {e}")
+            await query.message.reply_text(
+                "❌ Произошла ошибка.",
                 reply_markup=REPLY_KEYBOARD_MARKUP
             )
-            return
+        return
+
+    elif callback_data.startswith('delblock_'):
+        try:
+            announcement_id = int(callback_data.split('_')[1])
+            keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("✅ Да, удалить и заблокировать", callback_data=f'confirm_delblock_{announcement_id}'),
+                    InlineKeyboardButton("❌ Нет, отменить", callback_data=f'view_{announcement_id}')
+                ]
+            ])
+            await query.message.reply_text(
+                "⚠️ Вы уверены, что хотите удалить объявление и заблокировать пользователя?",
+                reply_markup=keyboard
+            )
+        except Exception as e:
+            logger.error(f"Ошибка при подготовке удаления с блокировкой: {e}")
+            await query.message.reply_text(
+                "❌ Произошла ошибка.",
+                reply_markup=REPLY_KEYBOARD_MARKUP
+            )
+        return
+
+    elif callback_data.startswith('confirm_del_'):
+        try:
+            announcement_id = int(callback_data.split('_')[2])
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            
+            # Удаляем объявление
+            cursor.execute('DELETE FROM blackmarket WHERE id=?', (announcement_id,))
+            conn.commit()
+            
+            await query.message.reply_text(
+                "✅ Объявление успешно удалено!",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« Назад", callback_data='black_market')]])
+            )
+        except Exception as e:
+            logger.error(f"Ошибка при удалении объявления: {e}")
+            await query.message.reply_text(
+                "❌ Произошла ошибка при удалении объявления.",
+                reply_markup=REPLY_KEYBOARD_MARKUP
+            )
+        finally:
+            if 'conn' in locals():
+                conn.close()
+        return
+
+    elif callback_data.startswith('confirm_delblock_'):
+        try:
+            announcement_id = int(callback_data.split('_')[2])
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            
+            # Получаем student_id из объявления
+            cursor.execute('SELECT student_id FROM blackmarket WHERE id=?', (announcement_id,))
+            result = cursor.fetchone()
+            if result:
+                student_id = result[0]
+                
+                # Блокируем пользователя
+                cursor.execute('UPDATE students SET blackmarket_allowed=0 WHERE student_id=?', (student_id,))
+                # Удаляем объявление
+                cursor.execute('DELETE FROM blackmarket WHERE id=?', (announcement_id,))
+                conn.commit()
+                
+                await query.message.reply_text(
+                    "✅ Объявление удалено и пользователь заблокирован!",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« Назад", callback_data='black_market')]])
+                )
+            else:
+                await query.message.reply_text(
+                    "❌ Объявление не найдено.",
+                    reply_markup=REPLY_KEYBOARD_MARKUP
+                )
+        except Exception as e:
+            logger.error(f"Ошибка при удалении объявления и блокировке: {e}")
+            await query.message.reply_text(
+                "❌ Произошла ошибка при удалении объявления и блокировке пользователя.",
+                reply_markup=REPLY_KEYBOARD_MARKUP
+            )
+        finally:
+            if 'conn' in locals():
+                conn.close()
+        return
+
+    elif callback_data == 'create_announcement':
+        rules_text = (
+            "📜 <b>Правила размещения объявлений:</b>\n\n"
+            "0. не оскорблять других пользователей\n"
+            "1. не продавать и не покупать запрещенные кодексом РБ и РФ товары и услуги\n"
+            "2. Запрещена реклама запрещенных товаров и услуг\n"
+            "3. Желательно, что бы обьявление было связано с универом и было хоть кому-то из студентов быть интересно. Для продажи гаража есть куфар.\n"
+            "4. Помните, что вы подписывали бумагу о том, что запрещено прибегать к помощи третьих лиц при написании курсовых работ\n"
+            "5. Администрация оставляет за собой право удалять объявления. Причем вы можете вообще лишиться возможности их публиковать\n\n"
+            "Вы согласны с правилами?"
+        )
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ Да", callback_data='accept_rules'),
+                InlineKeyboardButton("❌ Нет", callback_data='black_market')
+            ]
+        ])
+        await query.message.reply_text(rules_text, parse_mode='HTML', reply_markup=keyboard)
+        return
+
+    elif callback_data == 'accept_rules':
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("👤 Показать имя и группу", callback_data='create_public'),
+                InlineKeyboardButton("🕵️ Анонимно", callback_data='create_anon')
+            ],
+            [InlineKeyboardButton("« Отмена", callback_data='black_market')]
+        ])
         await query.message.reply_text(
-            "Введите номер студенческого билета:\n\nВы можете отменить действие командой /cancel.",
+            "Как вы хотите разместить объявление?",
+            reply_markup=keyboard
+        )
+        return
+
+    elif callback_data in ['create_public', 'create_anon']:
+        context.user_data['announcement_type'] = callback_data
+        context.user_data['creating_announcement'] = True
+        await query.message.reply_text(
+            "Введите короткий информативный заголовок (до 50 символов):\n\n"
+            "Вы можете отменить создание объявления командой /cancel",
             reply_markup=CANCEL_KEYBOARD_MARKUP
         )
-        context.user_data['awaiting_add_student_id'] = True
+        context.user_data['awaiting_title'] = True
         return
-    elif callback_data.startswith('student_'):
-        student_id = callback_data.split('_')[1]
-        await show_student_rating(query, student_id)
-        return
+
     elif callback_data == 'send_notification':
         if not is_superadmin:
             await query.message.reply_text(
@@ -1213,25 +1612,13 @@ async def handle_inline_buttons(update, context):
     elif callback_data == 'get_bot_log':
         if not is_superadmin:
             await query.message.reply_text(
-                "Только суперадминистратор может получать лог бота.",
+                "У вас нет прав для выполнения этого действия.",
                 reply_markup=REPLY_KEYBOARD_MARKUP
             )
             return
-            
         try:
-            log_path = 'bot.log'
-            if os.path.exists(log_path):
-                with open(log_path, 'rb') as f:
-                    await query.message.reply_document(
-                        f,
-                        filename='bot.log',
-                        caption="✅ Лог бота"
-                    )
-            else:
-                await query.message.reply_text(
-                    "❌ Файл лога не найден.",
-                    reply_markup=REPLY_KEYBOARD_MARKUP
-                )
+            with open('bot.log', 'rb') as f:
+                await query.message.reply_document(f, filename='bot.log')
         except Exception as e:
             logger.error(f"Ошибка при отправке лога: {e}")
             await query.message.reply_text(
@@ -1240,23 +1627,192 @@ async def handle_inline_buttons(update, context):
             )
         return
 
-    # Обработка других кнопок
-    # Просто игнорируем неизвестные callback_data без вывода сообщения
-    return
+    elif callback_data == 'notification_settings':
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ Включить", callback_data='notifications_on'),
+                InlineKeyboardButton("❌ Отключить", callback_data='notifications_off')
+            ],
+            [InlineKeyboardButton("« Назад", callback_data='notifications_menu')]
+        ])
+        await query.message.reply_text(
+            "🔔 Настройка системных уведомлений\n\n"
+            "Хотите ли вы получать уведомления о новых оценках и обновлениях?",
+            reply_markup=keyboard
+        )
+        return
 
-async def notify_superadmins(application, message):
-    """Отправляет уведомление всем суперадминам"""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    try:
-        cursor.execute('SELECT telegram_id FROM students WHERE is_superadmin=1 AND telegram_id IS NOT NULL AND telegram_id != "added by admin"')
-        superadmins = cursor.fetchall()
-        for (admin_id,) in superadmins:
-            try:
-                await application.bot.send_message(chat_id=admin_id, text=message, parse_mode='HTML')
-            except Exception as e:
-                logger.error(f"Ошибка при отправке уведомления суперадмину {admin_id}: {e}")
-    except Exception as e:
-        logger.error(f"Ошибка при получении списка суперадминов: {e}")
-    finally:
-        conn.close()
+    elif callback_data in ['notifications_on', 'notifications_off']:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        try:
+            new_value = 1 if callback_data == 'notifications_on' else 0
+            cursor.execute('UPDATE students SET notifications=? WHERE telegram_id=?', (new_value, telegram_id))
+            conn.commit()
+            status = "включены" if new_value else "отключены"
+            back_keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton("« Назад", callback_data="notifications_menu")
+            ]])
+            await query.message.reply_text(
+                f"✅ Настройки сохранены!\n"
+                f"Системные уведомления {status}.",
+                reply_markup=back_keyboard
+            )
+        except Exception as e:
+            logger.error(f"Ошибка при обновлении настроек уведомлений: {e}")
+            await query.message.reply_text(
+                "❌ Произошла ошибка при сохранении настроек.",
+                reply_markup=REPLY_KEYBOARD_MARKUP
+            )
+        finally:
+            conn.close()
+        return
+
+    elif callback_data == 'send_notification':
+        if not is_superadmin:
+            await query.message.reply_text(
+                "У вас нет прав для выполнения этого действия.",
+                reply_markup=REPLY_KEYBOARD_MARKUP
+            )
+            return
+        context.user_data['awaiting_notification'] = True
+        await query.message.reply_text(
+            "Введите текст уведомления:\n\n"
+            "Вы можете отменить отправку командой /cancel",
+            reply_markup=CANCEL_KEYBOARD_MARKUP
+        )
+        return
+
+    elif callback_data == 'notify_all':
+        if not is_superadmin:
+            await query.message.reply_text(
+                "У вас нет прав для выполнения этого действия.",
+                reply_markup=REPLY_KEYBOARD_MARKUP
+            )
+            return
+        context.user_data['notification_type'] = 'all'
+        context.user_data['awaiting_notification'] = True
+        await query.message.reply_text(
+            "Введите текст уведомления для всех пользователей:\n\n"
+            "Вы можете отменить отправку командой /cancel",
+            reply_markup=CANCEL_KEYBOARD_MARKUP
+        )
+        return
+
+    elif callback_data == 'notify_group':
+        if not is_superadmin:
+            await query.message.reply_text(
+                "У вас нет прав для выполнения этого действия.",
+                reply_markup=REPLY_KEYBOARD_MARKUP
+            )
+            return
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute('SELECT DISTINCT student_group FROM students WHERE student_group IS NOT NULL ORDER BY student_group')
+            groups = cursor.fetchall()
+            keyboard = []
+            for (group,) in groups:
+                keyboard.append([InlineKeyboardButton(group, callback_data=f'notify_group_{group}')])
+            keyboard.append([InlineKeyboardButton("« Назад", callback_data='send_notification')])
+            await query.message.reply_text(
+                "Выберите группу для отправки уведомления:",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+        except Exception as e:
+            logger.error(f"Ошибка при получении списка групп: {e}")
+            await query.message.reply_text(
+                "Произошла ошибка при получении списка групп.",
+                reply_markup=REPLY_KEYBOARD_MARKUP
+            )
+        finally:
+            conn.close()
+        return
+
+    elif callback_data.startswith('notify_group_'):
+        if not is_superadmin:
+            await query.message.reply_text(
+                "У вас нет прав для выполнения этого действия.",
+                reply_markup=REPLY_KEYBOARD_MARKUP
+            )
+            return
+        group = callback_data[len('notify_group_'):]
+        context.user_data['notification_type'] = 'group'
+        context.user_data['notification_group'] = group
+        context.user_data['awaiting_notification'] = True
+        await query.message.reply_text(
+            f"Введите текст уведомления для группы {group}:\n\n"
+            "Вы можете отменить отправку командой /cancel",
+            reply_markup=CANCEL_KEYBOARD_MARKUP
+        )
+        return
+
+    elif callback_data == 'add_student':
+        if not is_admin:
+            await query.message.reply_text(
+                "У вас нет прав для выполнения этого действия.",
+                reply_markup=REPLY_KEYBOARD_MARKUP
+            )
+            return
+        context.user_data['awaiting_add_student_id'] = True
+        await query.message.reply_text(
+            "Введите номер студенческого билета студента, которого хотите добавить:\n\n"
+            "Вы можете отменить действие командой /cancel",
+            reply_markup=CANCEL_KEYBOARD_MARKUP
+        )
+        return
+
+    elif callback_data == 'add_admin':
+        if not is_admin:
+            await query.message.reply_text(
+                "У вас нет прав для выполнения этого действия.",
+                reply_markup=REPLY_KEYBOARD_MARKUP
+            )
+            return
+        context.user_data['awaiting_add_admin_id'] = True
+        await query.message.reply_text(
+            "Введите номер студенческого билета пользователя, которого хотите сделать администратором:\n\n"
+            "Вы можете отменить действие командой /cancel",
+            reply_markup=CANCEL_KEYBOARD_MARKUP
+        )
+        return
+
+    elif callback_data == 'add_other_group_user':
+        if not is_superadmin:
+            await query.message.reply_text(
+                "У вас нет прав для выполнения этого действия.",
+                reply_markup=REPLY_KEYBOARD_MARKUP
+            )
+            return
+        context.user_data['awaiting_superadmin_student_id'] = True
+        await query.message.reply_text(
+            "Введите номер студенческого билета пользователя:\n\n"
+            "Вы можете отменить действие командой /cancel",
+            reply_markup=CANCEL_KEYBOARD_MARKUP
+        )
+        return
+
+    elif callback_data.startswith('student_'):
+        student_id = callback_data.split('_')[1]
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("SELECT * FROM students WHERE student_id=?", (student_id,))
+            row = cursor.fetchone()
+            if not row:
+                await query.message.reply_text(
+                    "Студент не найден.",
+                    reply_markup=REPLY_KEYBOARD_MARKUP
+                )
+                return
+            columns = [desc[0] for desc in cursor.description]
+            student_data = dict(zip(columns, row))
+            name = student_data.get('name', 'Неизвестно')
+            message = format_ratings_table(name, student_data)
+            await query.message.reply_text(message, parse_mode='HTML', reply_markup=REPLY_KEYBOARD_MARKUP)
+        except Exception as e:
+            logger.error(f"Database error: {e}")
+            await query.message.reply_text("Произошла ошибка при получении данных.\n\nВы можете вернуться в главное меню командой /cancel.")
+        finally:
+            conn.close()
+        return

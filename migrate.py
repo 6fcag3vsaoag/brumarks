@@ -23,51 +23,47 @@ def backup_database():
         return False
 
 def migrate_database():
-    """Добавляет поле notifications в таблицу students"""
+    """Выполняет миграцию базы данных"""
     try:
-        # Подключаемся к базе данных
         conn = sqlite3.connect('students.db')
         cursor = conn.cursor()
+
+        # Добавляем новые колонки в таблицу students
+        cursor.execute('''
+            ALTER TABLE students 
+            ADD COLUMN blackmarket_allowed INTEGER DEFAULT 1
+        ''')
+        cursor.execute('''
+            ALTER TABLE students 
+            ADD COLUMN blackmarket_announcements INTEGER DEFAULT 1
+        ''')
+
+        # Создаем новую таблицу blackmarket
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS blackmarket (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                student_id TEXT NOT NULL,
+                is_anon INTEGER DEFAULT 0,
+                title TEXT NOT NULL,
+                content TEXT NOT NULL,
+                contacts TEXT NOT NULL,
+                publication_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (student_id) REFERENCES students(student_id)
+            )
+        ''')
+
+        conn.commit()
+        print("✅ Миграция успешно выполнена")
         
-        # Проверяем, существует ли уже колонка notifications
-        cursor.execute("PRAGMA table_info(students)")
-        columns = [column[1] for column in cursor.fetchall()]
-        
-        if 'notifications' not in columns:
-            # Добавляем колонку notifications
-            cursor.execute('''
-                ALTER TABLE students 
-                ADD COLUMN notifications INTEGER DEFAULT 1
-            ''')
-            
-            # Устанавливаем значение 1 для всех существующих записей
-            cursor.execute('''
-                UPDATE students 
-                SET notifications = 1 
-                WHERE notifications IS NULL
-            ''')
-            
-            conn.commit()
-            print("✅ Миграция успешно завершена")
-            print("• Добавлена колонка notifications")
-            print("• Установлено значение по умолчанию (1) для всех пользователей")
+    except sqlite3.OperationalError as e:
+        if "duplicate column name" in str(e).lower():
+            print("ℹ️ Колонки уже существуют, пропускаем...")
         else:
-            print("ℹ️ Колонка notifications уже существует")
-        
-        # Выводим количество обновленных записей
-        cursor.execute("SELECT COUNT(*) FROM students")
-        total_records = cursor.fetchone()[0]
-        print(f"📊 Всего записей в базе: {total_records}")
-        
-        cursor.execute("SELECT COUNT(*) FROM students WHERE notifications = 1")
-        enabled_notifications = cursor.fetchone()[0]
-        print(f"🔔 Пользователей с включенными уведомлениями: {enabled_notifications}")
-        
+            print(f"❌ Ошибка SQL при миграции: {e}")
     except Exception as e:
-        print(f"❌ Ошибка при миграции: {e}")
+        print(f"❌ Неожиданная ошибка при миграции: {e}")
     finally:
-        if conn:
-            conn.close()
+        conn.close()
 
 def main():
     print("🔄 Начало процесса миграции базы данных")
