@@ -15,37 +15,6 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMa
 from archive_manager import CourseWorkArchiveManager
 from datetime import datetime
 
-def encode_announcement_data(student_id, title, pub_time):
-    try:
-        # Берем только дату и время без миллисекунд для уменьшения размера
-        if isinstance(pub_time, str) and len(pub_time) > 19:
-            pub_time = pub_time[:19]
-        
-        # Создаем сокращенный формат данных
-        data = f"{student_id}:{title}:{pub_time}"
-        # Кодируем в base64 и убираем padding
-        encoded = base64.urlsafe_b64encode(data.encode()).decode().rstrip('=')
-        return encoded
-    except Exception as e:
-        logger.error(f"Ошибка при кодировании данных объявления: {e}")
-        return None
-
-def decode_announcement_data(encoded_data):
-    try:
-        # Добавляем padding обратно если нужно
-        padding = 4 - (len(encoded_data) % 4)
-        if padding != 4:
-            encoded_data += '=' * padding
-            
-        # Декодируем из base64
-        decoded = base64.urlsafe_b64decode(encoded_data).decode()
-        # Разбиваем строку на компоненты
-        student_id, title, pub_time = decoded.split(':', 2)
-        return student_id, title, pub_time
-    except Exception as e:
-        logger.error(f"Ошибка при декодировании данных объявления: {e}")
-        return None, None, None
-
 @handle_telegram_timeout()
 async def handle_message(update, context):
     text = update.message.text.strip()
@@ -617,6 +586,9 @@ async def handle_message(update, context):
             ''', (student_id, is_anon, title, content, contacts, current_time))
             conn.commit()
 
+            # Получаем ID только что созданного объявления
+            announcement_id = cursor.lastrowid
+
             # Отправляем уведомления пользователям
             cursor.execute('''
                 SELECT telegram_id 
@@ -629,30 +601,59 @@ async def handle_message(update, context):
             ''', (telegram_id,))
             users_to_notify = cursor.fetchall()
 
+            logger.info(f"Найдено {len(users_to_notify)} пользователей для уведомления о новом объявлении")
+
             # Формируем текст уведомления
+            preview_length = 200
+            content_preview = content[:preview_length] + "..." if len(content) > preview_length else content
+            
+            # Получаем информацию об авторе
+            author_info = "🕵️ Анонимно" if is_anon else f"👤 {name} ({student_group})"
+            
             notification = (
-                "🆕 <b>Новое объявление в Black Market!</b>\n\n"
-                f"<b>{title}</b>\n\n"
-                f"{content[:100]}..." if len(content) > 100 else content
+                "🔔 <b>НОВОЕ ОБЪЯВЛЕНИЕ НА BLACK MARKET!</b> 🏪\n"
+                "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"📌 <b>{title}</b>\n\n"
+                f"👥 <b>Автор:</b> {author_info}\n"
+                f"📞 <b>Контакты:</b> {contacts}\n"
+                f"⏰ <b>Опубликовано:</b> {current_time}\n\n"
+                f"📝 <b>Описание:</b>\n{content_preview}\n\n"
+                "━━━━━━━━━━━━━━━━━━━━━━\n"
+                "👇 Нажмите кнопку ниже, чтобы посмотреть полное объявление"
             )
 
-            # Кодируем данные для callback
-            encoded_data = encode_announcement_data(student_id, title, current_time)
-
-            # Отправляем уведомления
+            # Отправляем уведомления с простым ID объявления
+            success_count = 0
             for (user_telegram_id,) in users_to_notify:
                 try:
                     keyboard = InlineKeyboardMarkup([[
-                        InlineKeyboardButton("👁 Посмотреть", callback_data=f'view_announcement_{encoded_data}')
+                        InlineKeyboardButton("👁 Посмотреть", callback_data=f'view_{announcement_id}')
                     ]])
+                    
+                    # Проверяем, что telegram_id является числом
+                    try:
+                        user_telegram_id_int = int(user_telegram_id)
+                    except (ValueError, TypeError):
+                        logger.error(f"Некорректный telegram_id: {user_telegram_id}")
+                        continue
+
                     await context.application.bot.send_message(
-                        chat_id=user_telegram_id,
+                        chat_id=user_telegram_id_int,
                         text=notification,
                         parse_mode='HTML',
                         reply_markup=keyboard
                     )
+                    success_count += 1
+                    logger.info(f"Уведомление успешно отправлено пользователю {user_telegram_id}")
                 except Exception as e:
-                    logger.error(f"Ошибка при отправке уведомления пользователю {user_telegram_id}: {e}")
+                    if "Forbidden: bot was blocked by the user" in str(e):
+                        logger.warning(f"Бот заблокирован пользователем {user_telegram_id}")
+                    elif "chat not found" in str(e):
+                        logger.warning(f"Чат не найден для пользователя {user_telegram_id}")
+                    else:
+                        logger.error(f"Ошибка при отправке уведомления пользователю {user_telegram_id}: {str(e)}")
+
+            logger.info(f"Уведомления отправлены успешно: {success_count} из {len(users_to_notify)}")
 
             # Возвращаем пользователя в меню черного рынка
             keyboard = InlineKeyboardMarkup([[
