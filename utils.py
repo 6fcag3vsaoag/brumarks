@@ -35,6 +35,98 @@ logger.addHandler(file_handler)
 with open('config.json') as config_file:
     config = json.load(config_file)
 
+# Global week type
+WEEK_TYPE = "UP"  # Может быть "UP" или "DOWN"
+
+def get_week_type():
+    """Возвращает текущий тип недели и при необходимости автоматически переключает его"""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT value, updated_at FROM bot_settings WHERE key=?', ('week_type',))
+        result = cursor.fetchone()
+        
+        if not result:
+            # Если настройки не найдены, создаем их
+            initial_data = {
+                'current_type': 'UP',
+                'last_change': datetime.datetime.now().isoformat(),
+                'auto_switch': True
+            }
+            cursor.execute(
+                'INSERT INTO bot_settings (key, value, updated_at) VALUES (?, ?, ?)',
+                ('week_type', json.dumps(initial_data), datetime.datetime.now().isoformat())
+            )
+            conn.commit()
+            return 'UP'
+            
+        settings = json.loads(result[0])
+        last_change = datetime.datetime.fromisoformat(settings['last_change'])
+        current_type = settings['current_type']
+        auto_switch = settings.get('auto_switch', True)
+        
+        if not auto_switch:
+            return current_type
+            
+        # Проверяем, нужно ли переключить тип недели
+        now = datetime.datetime.now()
+        days_since_change = (now - last_change).days
+        
+        # Если прошло больше недели с последнего изменения
+        if days_since_change >= 7:
+            # Вычисляем, сколько недель прошло
+            weeks_passed = days_since_change // 7
+            # Если нечетное количество недель, меняем тип
+            if weeks_passed % 2 == 1:
+                new_type = 'DOWN' if current_type == 'UP' else 'UP'
+                settings['current_type'] = new_type
+                settings['last_change'] = now.isoformat()
+                
+                cursor.execute(
+                    'UPDATE bot_settings SET value=?, updated_at=? WHERE key=?',
+                    (json.dumps(settings), now.isoformat(), 'week_type')
+                )
+                conn.commit()
+                return new_type
+                
+        return current_type
+
+def set_week_type_settings(new_type=None, auto_switch=None):
+    """
+    Обновляет настройки типа недели
+    :param new_type: Новый тип недели ('UP' или 'DOWN')
+    :param auto_switch: Включить/выключить автоматическое переключение (True/False)
+    """
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT value FROM bot_settings WHERE key=?', ('week_type',))
+        result = cursor.fetchone()
+        
+        if result:
+            settings = json.loads(result[0])
+        else:
+            settings = {
+                'current_type': 'UP',
+                'last_change': datetime.datetime.now().isoformat(),
+                'auto_switch': True
+            }
+        
+        if new_type is not None:
+            if new_type not in ['UP', 'DOWN']:
+                raise ValueError("Week type must be either 'UP' or 'DOWN'")
+            settings['current_type'] = new_type
+            settings['last_change'] = datetime.datetime.now().isoformat()
+            
+        if auto_switch is not None:
+            settings['auto_switch'] = bool(auto_switch)
+        
+        now = datetime.datetime.now()
+        cursor.execute(
+            'INSERT OR REPLACE INTO bot_settings (key, value, updated_at) VALUES (?, ?, ?)',
+            ('week_type', json.dumps(settings), now.isoformat())
+        )
+        conn.commit()
+        return settings
+
 # Keyboards
 INLINE_KEYBOARD = [
     [
@@ -43,6 +135,9 @@ INLINE_KEYBOARD = [
     ],
     [
         InlineKeyboardButton("Дисциплины", callback_data='disciplines'),
+        InlineKeyboardButton("Расписание", callback_data='schedule')
+    ],
+    [
         InlineKeyboardButton("Мой Профиль", callback_data='settings')
     ]
 ]

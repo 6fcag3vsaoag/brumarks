@@ -3,9 +3,13 @@ from telegram import Update
 from telegram.error import NetworkError, TimedOut
 from utils import (
     logger, config, get_db_connection, require_registration, REPLY_KEYBOARD_MARKUP,
-    INLINE_KEYBOARD_MARKUP, format_ratings_table, show_student_rating, handle_telegram_timeout
+    INLINE_KEYBOARD_MARKUP, format_ratings_table, show_student_rating, handle_telegram_timeout,
+    send_notification_to_users
 )
-from handlers import handle_message, handle_inline_buttons
+from handlers import (
+    handle_message, handle_inline_buttons,
+    settings_menu, handle_settings_callback
+)
 from scheduler import StudentParserScheduler
 import asyncio
 import signal
@@ -88,7 +92,8 @@ def init_db():
                 backup_telegram_ids TEXT DEFAULT '[]',
                 last_parsed_time TEXT,
                 is_superadmin INTEGER DEFAULT 0,
-                notifications INTEGER DEFAULT 1
+                notifications INTEGER DEFAULT 1,
+                subgroup INTEGER DEFAULT 1
             )
         ''')
         cursor.execute('''
@@ -112,6 +117,43 @@ def init_db():
                 total_size INTEGER DEFAULT 0
             )
         ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS disciplines (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                group_name TEXT NOT NULL,
+                disc_1 TEXT,
+                disc_2 TEXT,
+                disc_3 TEXT,
+                disc_4 TEXT,
+                disc_5 TEXT,
+                disc_6 TEXT,
+                disc_7 TEXT,
+                disc_8 TEXT,
+                disc_9 TEXT,
+                disc_10 TEXT,
+                disc_11 TEXT,
+                disc_12 TEXT,
+                disc_13 TEXT,
+                disc_14 TEXT,
+                disc_15 TEXT,
+                disc_16 TEXT,
+                disc_17 TEXT,
+                disc_18 TEXT,
+                disc_19 TEXT,
+                disc_20 TEXT,
+                disc_21 TEXT,
+                disc_22 TEXT,
+                disc_23 TEXT,
+                disc_24 TEXT,
+                disc_25 TEXT,
+                disc_26 TEXT,
+                disc_27 TEXT,
+                disc_28 TEXT,
+                disc_29 TEXT,
+                disc_30 TEXT,
+                UNIQUE(group_name)
+            )
+        ''')
         conn.commit()
 
 # Initialize database
@@ -127,7 +169,9 @@ scheduler = StudentParserScheduler(application)
 application.add_handler(CommandHandler("start", start_command))
 application.add_handler(CommandHandler("cancel", cancel_command))
 application.add_handler(CommandHandler("menu", menu_command))
+application.add_handler(CommandHandler("settings", settings_menu))
 application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+application.add_handler(CallbackQueryHandler(handle_settings_callback, pattern='^toggle_'))
 application.add_handler(CallbackQueryHandler(handle_inline_buttons))
 
 def handle_exception(loop, context):

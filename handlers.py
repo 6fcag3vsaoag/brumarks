@@ -5,15 +5,16 @@ import base64
 import zipfile
 import tempfile
 import asyncio
+import traceback
 from utils import (
     logger, get_db_connection, check_registration, parse_student_data, save_to_db,
     show_student_rating, format_ratings_table, REPLY_KEYBOARD_MARKUP,
     CANCEL_KEYBOARD_MARKUP, INLINE_KEYBOARD_MARKUP, validate_student_id, validate_group_format, validate_student_group, handle_telegram_timeout,
-    send_notification_to_users
+    send_notification_to_users, get_week_type, set_week_type_settings
 )
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from archive_manager import CourseWorkArchiveManager
-from datetime import datetime
+from datetime import datetime, timedelta
 
 @handle_telegram_timeout()
 async def handle_message(update, context):
@@ -676,7 +677,198 @@ async def handle_message(update, context):
             conn.close()
         return
 
-    # Убираем универсальное сообщение 'Пожалуйста, используйте кнопки меню...'
+    # Обработка ввода информации о дисциплине
+    if context.user_data.get('editing_discipline'):
+        editing_data = context.user_data['editing_discipline']
+        disc_num = editing_data['number']
+        step = editing_data['step']
+        
+        if step == 'discipline_name':
+            editing_data['discipline'] = text
+            editing_data['step'] = 'lector_name'
+            await update.message.reply_text(
+                "Введите полное имя преподавателя (многие студенты с трудом запоминают имена, вводите полное имя):",
+                reply_markup=CANCEL_KEYBOARD_MARKUP
+            )
+            return
+            
+        elif step == 'lector_name':
+            editing_data['lector_name'] = text
+            editing_data['step'] = 'auditory'
+            await update.message.reply_text(
+                "Введите аудиторию:",
+                reply_markup=CANCEL_KEYBOARD_MARKUP
+            )
+            return
+            
+        elif step == 'auditory':
+            editing_data['auditory'] = text
+            editing_data['step'] = 'admin_comment'
+            await update.message.reply_text(
+                "Введите комментарий для студентов (если нет, напишите 'нет'):",
+                reply_markup=CANCEL_KEYBOARD_MARKUP
+            )
+            return
+            
+        elif step == 'admin_comment':
+            editing_data['admin_comment'] = text if text.lower() != 'нет' else ''
+            
+            # Сохраняем данные в базу
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            try:
+                # Получаем группу администратора
+                cursor.execute('SELECT student_group FROM students WHERE telegram_id=?', (user_id,))
+                result = cursor.fetchone()
+                if not result:
+                    await update.message.reply_text(
+                        "Ошибка: группа не найдена.",
+                        reply_markup=REPLY_KEYBOARD_MARKUP
+                    )
+                    return
+                    
+                group = result[0]
+                
+                # Создаем JSON с данными дисциплины
+                discipline_data = {
+                    'discipline': editing_data['discipline'],
+                    'lector_name': editing_data['lector_name'],
+                    'auditory': editing_data['auditory'],
+                    'admin_comment': editing_data['admin_comment']
+                }
+                
+                # Обновляем данные в базе
+                cursor.execute(f'''
+                    UPDATE disciplines 
+                    SET disc_{disc_num}=? 
+                    WHERE group_name=?
+                ''', (json.dumps(discipline_data), group))
+                conn.commit()
+                
+                # Очищаем данные редактирования
+                context.user_data.pop('editing_discipline', None)
+                
+                keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("« Назад", callback_data='setup_disciplines')]])
+                await update.message.reply_text(
+                    "✅ Информация о дисциплине успешно сохранена!",
+                    reply_markup=keyboard
+                )
+                
+            except Exception as e:
+                logger.error(f"Ошибка при сохранении информации о дисциплине: {e}")
+                await update.message.reply_text(
+                    "Произошла ошибка при сохранении информации о дисциплине.",
+                    reply_markup=REPLY_KEYBOARD_MARKUP
+                )
+            finally:
+                conn.close()
+            return
+
+    # Обработка ввода расписания
+    if context.user_data.get('awaiting_schedule_input'):
+        schedule_data = context.user_data.get('editing_schedule', {})
+        if not schedule_data:
+            await update.message.reply_text(
+                "Ошибка: данные для редактирования не найдены.",
+                reply_markup=REPLY_KEYBOARD_MARKUP
+            )
+            return
+
+        # Разбиваем введенное расписание на строки
+        lessons = text.split('\n')
+        lessons = [lesson.strip() for lesson in lessons if lesson.strip()]
+        
+        # Проверяем формат ввода
+        valid_lessons = []
+        for lesson in lessons:
+            if not lesson.startswith(('1.', '2.', '3.', '4.', '5.')):
+                await update.message.reply_text(
+                    "Неверный формат ввода. Каждая строка должна начинаться с номера пары (1-5) и точки.",
+                    reply_markup=CANCEL_KEYBOARD_MARKUP
+                )
+                return
+            valid_lessons.append(lesson[2:].strip())  # Убираем номер и точку
+
+        # Заполняем пустыми значениями отсутствующие пары
+        while len(valid_lessons) < 5:
+            valid_lessons.append('')
+
+        # Сохраняем расписание в базу
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        try:
+            # Получаем группу администратора
+            cursor.execute('SELECT student_group FROM students WHERE telegram_id=?', (user_id,))
+            group_result = cursor.fetchone()
+            if not group_result:
+                await update.message.reply_text(
+                    "Ошибка: группа не найдена.",
+                    reply_markup=REPLY_KEYBOARD_MARKUP
+                )
+                return
+
+            group = group_result[0]
+            day = schedule_data['day']
+            subgroup = schedule_data['subgroup']
+            week_type = schedule_data['week_type']
+
+            # Проверяем существование записи
+            cursor.execute('''
+                SELECT 1 FROM raspisanie 
+                WHERE group_full_name=? AND subgroup=? AND week_type=?
+            ''', (group, subgroup, week_type))
+            exists = cursor.fetchone()
+
+            if exists:
+                # Обновляем существующее расписание
+                updates = []
+                values = []
+                for i, lesson in enumerate(valid_lessons, 1):
+                    updates.append(f"{day}_{i}=?")
+                    values.append(lesson)
+                values.extend([group, subgroup, week_type])
+                
+                query = f'''
+                    UPDATE raspisanie 
+                    SET {', '.join(updates)}
+                    WHERE group_full_name=? AND subgroup=? AND week_type=?
+                '''
+                cursor.execute(query, values)
+            else:
+                # Создаем новую запись
+                columns = [f"{day}_{i}" for i in range(1, 6)]
+                placeholders = ['?'] * 5
+                values = valid_lessons + [group, subgroup, week_type]
+                
+                query = f'''
+                    INSERT INTO raspisanie (
+                        {', '.join(columns)},
+                        group_full_name, subgroup, week_type
+                    ) VALUES ({', '.join(placeholders)}, ?, ?, ?)
+                '''
+                cursor.execute(query, values)
+
+            conn.commit()
+            
+            # Очищаем данные ожидания ввода
+            context.user_data.pop('awaiting_schedule_input', None)
+            context.user_data.pop('editing_schedule', None)
+            
+            # Отправляем сообщение об успешном сохранении
+            keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("« Назад", callback_data='edit_schedule')]])
+            await update.message.reply_text(
+                "✅ Расписание успешно сохранено!",
+                reply_markup=keyboard
+            )
+            
+        except Exception as e:
+            logger.error(f"Ошибка при сохранении расписания: {e}")
+            await update.message.reply_text(
+                "Произошла ошибка при сохранении расписания.",
+                reply_markup=REPLY_KEYBOARD_MARKUP
+            )
+        finally:
+            conn.close()
     return
 
 @handle_telegram_timeout()
@@ -1137,6 +1329,7 @@ async def handle_inline_buttons(update, context):
             keyboard.append([InlineKeyboardButton("👥 Добавить админа", callback_data='add_admin')])
         
         if is_superadmin:
+            keyboard.append([InlineKeyboardButton("📅 Задать тип недели", callback_data='set_week_type')])
             keyboard.append([InlineKeyboardButton("➕ Добавить пользователя другой группы", callback_data='add_other_group_user')])
             keyboard.append([InlineKeyboardButton("📢 Отправить системное уведомление", callback_data='send_notification')])
             keyboard.append([InlineKeyboardButton("📋 Получить лог бота", callback_data='get_bot_log')])
@@ -1146,6 +1339,871 @@ async def handle_inline_buttons(update, context):
             "Выберите нужный пункт меню:",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
+        return
+
+    elif callback_data == 'schedule':
+        keyboard = []
+        keyboard.append([InlineKeyboardButton("📅 Расписание На Сегодня", callback_data='schedule_today')])
+        keyboard.append([InlineKeyboardButton("📅 Расписание На Завтра", callback_data='schedule_tomorrow')])
+        keyboard.append([InlineKeyboardButton("📅 Расписание На Неделю", callback_data='schedule_week')])
+        
+        if is_admin:
+            keyboard.append([InlineKeyboardButton("✏️ Редактировать Расписание", callback_data='edit_schedule')])
+            keyboard.append([InlineKeyboardButton("📚 Задать список дисциплин", callback_data='setup_disciplines')])
+        
+        keyboard.append([InlineKeyboardButton("« Назад", callback_data='settings')])
+        
+        await query.message.reply_text(
+            "📅 Расписание\n"
+            "Выберите действие:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return
+
+    elif callback_data == 'setup_disciplines':
+        if not is_admin:
+            await query.message.reply_text(
+                "У вас нет прав для редактирования дисциплин.",
+                reply_markup=REPLY_KEYBOARD_MARKUP
+            )
+            return
+            
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        try:
+            # Получаем группу администратора
+            cursor.execute('SELECT student_group FROM students WHERE telegram_id=?', (telegram_id,))
+            result = cursor.fetchone()
+            if not result:
+                await query.message.reply_text(
+                    "Ошибка: группа не найдена.",
+                    reply_markup=REPLY_KEYBOARD_MARKUP
+                )
+                return
+                
+            group = result[0]
+            
+            # Получаем список дисциплин для группы
+            cursor.execute('SELECT * FROM disciplines WHERE group_name=?', (group,))
+            disciplines = cursor.fetchone()
+            
+            # Получаем имена колонок
+            cursor.execute('PRAGMA table_info(disciplines)')
+            columns = {row[1]: idx for idx, row in enumerate(cursor.fetchall())}
+            
+            keyboard = []
+            if disciplines:
+                for i in range(1, 31):
+                    disc_field = f'disc_{i}'
+                    disc_data = disciplines[columns[disc_field]] if disc_field in columns else None
+                    if disc_data:
+                        try:
+                            disc_info = json.loads(disc_data)
+                            if disc_info.get('inactive'):
+                                button_text = f"{i}. inactive"
+                            else:
+                                button_text = f"{i}. {disc_info.get('discipline', 'Не задано')}"
+                        except json.JSONDecodeError:
+                            button_text = f"{i}. Ошибка данных"
+                    else:
+                        button_text = f"{i}. Не задано"
+                    keyboard.append([InlineKeyboardButton(button_text, callback_data=f'edit_disc_{i}')])
+            else:
+                # Создаем новую запись для группы
+                cursor.execute('INSERT INTO disciplines (group_name) VALUES (?)', (group,))
+                conn.commit()
+                for i in range(1, 31):
+                    keyboard.append([InlineKeyboardButton(f"{i}. Не задано", callback_data=f'edit_disc_{i}')])
+            
+            keyboard.append([InlineKeyboardButton("« Назад", callback_data='schedule')])
+            
+            await query.message.reply_text(
+                "📚 Настройка списка дисциплин\n"
+                "Выберите номер дисциплины для редактирования:",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            
+        except Exception as e:
+            logger.error(f"Ошибка при получении списка дисциплин: {e}")
+            await query.message.reply_text(
+                "Произошла ошибка при получении списка дисциплин.",
+                reply_markup=REPLY_KEYBOARD_MARKUP
+            )
+        finally:
+            conn.close()
+        return
+
+    elif callback_data.startswith('edit_disc_'):
+        if not is_admin:
+            await query.message.reply_text(
+                "У вас нет прав для редактирования дисциплин.",
+                reply_markup=REPLY_KEYBOARD_MARKUP
+            )
+            return
+            
+        disc_num = callback_data.split('_')[2]
+        keyboard = [
+            [InlineKeyboardButton("✏️ Настроить", callback_data=f'setup_disc_{disc_num}')],
+            [InlineKeyboardButton("❌ Сделать неактивной", callback_data=f'deactivate_disc_{disc_num}')],
+            [InlineKeyboardButton("« Назад", callback_data='setup_disciplines')]
+        ]
+        
+        await query.message.reply_text(
+            f"Выберите действие для дисциплины {disc_num}:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return
+
+    elif callback_data.startswith('deactivate_disc_'):
+        if not is_admin:
+            await query.message.reply_text(
+                "У вас нет прав для редактирования дисциплин.",
+                reply_markup=REPLY_KEYBOARD_MARKUP
+            )
+            return
+            
+        disc_num = callback_data.split('_')[2]
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        try:
+            # Получаем группу администратора
+            cursor.execute('SELECT student_group FROM students WHERE telegram_id=?', (telegram_id,))
+            result = cursor.fetchone()
+            if not result:
+                await query.message.reply_text(
+                    "Ошибка: группа не найдена.",
+                    reply_markup=REPLY_KEYBOARD_MARKUP
+                )
+                return
+                
+            group = result[0]
+            
+            # Обновляем статус дисциплины
+            cursor.execute(f'''
+                UPDATE disciplines 
+                SET disc_{disc_num}=? 
+                WHERE group_name=?
+            ''', (json.dumps({'inactive': True}), group))
+            conn.commit()
+            
+            await query.message.reply_text(
+                "✅ Дисциплина помечена как неактивная",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« Назад", callback_data='setup_disciplines')]])
+            )
+            
+        except Exception as e:
+            logger.error(f"Ошибка при деактивации дисциплины: {e}")
+            await query.message.reply_text(
+                "Произошла ошибка при деактивации дисциплины.",
+                reply_markup=REPLY_KEYBOARD_MARKUP
+            )
+        finally:
+            conn.close()
+        return
+
+    elif callback_data.startswith('setup_disc_'):
+        if not is_admin:
+            await query.message.reply_text(
+                "У вас нет прав для редактирования дисциплин.",
+                reply_markup=REPLY_KEYBOARD_MARKUP
+            )
+            return
+            
+        disc_num = callback_data.split('_')[2]
+        context.user_data['editing_discipline'] = {
+            'number': disc_num,
+            'step': 'discipline_name'
+        }
+        
+        await query.message.reply_text(
+            "Введите название дисциплины:",
+            reply_markup=CANCEL_KEYBOARD_MARKUP
+        )
+        return
+
+    elif callback_data == 'schedule_today':
+        # Получаем расписание на сегодня
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        try:
+            # Получаем группу пользователя
+            cursor.execute('SELECT student_group, subgroup FROM students WHERE telegram_id=?', (telegram_id,))
+            result = cursor.fetchone()
+            if not result:
+                await query.message.reply_text(
+                    "Ошибка: группа не найдена.",
+                    reply_markup=REPLY_KEYBOARD_MARKUP
+                )
+                return
+                
+            group, subgroup = result
+            if not subgroup:
+                subgroup = 1  # По умолчанию первая подгруппа
+                
+            # Определяем текущий день недели
+            weekday = datetime.now().strftime('%A').lower()
+            
+            # Получаем тип недели из глобальной переменной
+            week_type = get_week_type()
+            
+            # Получаем расписание
+            cursor.execute(f'''
+                SELECT {weekday}_1, {weekday}_2, {weekday}_3, {weekday}_4, {weekday}_5
+                FROM raspisanie 
+                WHERE group_full_name=? AND subgroup=? AND week_type=?
+            ''', (group, subgroup, week_type))
+            schedule = cursor.fetchone()
+            
+            if not schedule:
+                await query.message.reply_text(
+                    "Расписание на сегодня не найдено.",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« Назад", callback_data='schedule')]])
+                )
+                return
+                
+            # Форматируем расписание
+            week_type_text = "верхняя" if week_type == "UP" else "нижняя"
+            message = f"📅 Расписание на сегодня ({datetime.now().strftime('%d.%m.%Y')})\n"
+            message += f"Группа: {group}, Подгруппа: {subgroup}\n"
+            message += f"Неделя: {week_type_text}\n\n"
+            
+            for i, lesson in enumerate(schedule, 1):
+                if lesson and lesson.strip():
+                    message += f"{i}. {lesson}\n"
+            
+            await query.message.reply_text(
+                message,
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« Назад", callback_data='schedule')]])
+            )
+            
+        except Exception as e:
+            logger.error(f"Ошибка при получении расписания: {e}")
+            await query.message.reply_text(
+                "Произошла ошибка при получении расписания.",
+                reply_markup=REPLY_KEYBOARD_MARKUP
+            )
+        finally:
+            conn.close()
+        return
+
+    elif callback_data == 'schedule_tomorrow':
+        # Получаем расписание на завтра
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        try:
+            # Получаем группу пользователя
+            cursor.execute('SELECT student_group, subgroup FROM students WHERE telegram_id=?', (telegram_id,))
+            result = cursor.fetchone()
+            if not result:
+                await query.message.reply_text(
+                    "Ошибка: группа не найдена.",
+                    reply_markup=REPLY_KEYBOARD_MARKUP
+                )
+                return
+                
+            group, subgroup = result
+            if not subgroup:
+                subgroup = 1  # По умолчанию первая подгруппа
+                
+            # Определяем завтрашний день недели
+            tomorrow = datetime.now() + timedelta(days=1)
+            weekday = tomorrow.strftime('%A').lower()
+            
+            # Получаем тип недели
+            week_type = get_week_type()
+            # Если сегодня воскресенье, меняем тип недели на противоположный
+            if datetime.now().strftime('%A').lower() == 'sunday':
+                week_type = "DOWN" if week_type == "UP" else "UP"
+            
+            # Получаем расписание
+            cursor.execute(f'''
+                SELECT {weekday}_1, {weekday}_2, {weekday}_3, {weekday}_4, {weekday}_5
+                FROM raspisanie 
+                WHERE group_full_name=? AND subgroup=? AND week_type=?
+            ''', (group, subgroup, week_type))
+            schedule = cursor.fetchone()
+            
+            if not schedule:
+                await query.message.reply_text(
+                    "Расписание на завтра не найдено.",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« Назад", callback_data='schedule')]])
+                )
+                return
+                
+            # Форматируем расписание
+            week_type_text = "верхняя" if week_type == "UP" else "нижняя"
+            message = f"📅 Расписание на завтра ({tomorrow.strftime('%d.%m.%Y')})\n"
+            message += f"Группа: {group}, Подгруппа: {subgroup}\n"
+            message += f"Неделя: {week_type_text}\n\n"
+            
+            for i, lesson in enumerate(schedule, 1):
+                if lesson and lesson.strip():
+                    message += f"{i}. {lesson}\n"
+            
+            await query.message.reply_text(
+                message,
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« Назад", callback_data='schedule')]])
+            )
+            
+        except Exception as e:
+            logger.error(f"Ошибка при получении расписания: {e}")
+            await query.message.reply_text(
+                "Произошла ошибка при получении расписания.",
+                reply_markup=REPLY_KEYBOARD_MARKUP
+            )
+        finally:
+            conn.close()
+        return
+
+    elif callback_data == 'schedule_week':
+        # Получаем расписание на неделю
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        try:
+            # Получаем группу пользователя
+            cursor.execute('SELECT student_group, subgroup FROM students WHERE telegram_id=?', (telegram_id,))
+            result = cursor.fetchone()
+            if not result:
+                await query.message.reply_text(
+                    "Ошибка: группа не найдена.",
+                    reply_markup=REPLY_KEYBOARD_MARKUP
+                )
+                return
+                
+            group, subgroup = result
+            if not subgroup:
+                subgroup = 1  # По умолчанию первая подгруппа
+                
+            # Получаем тип недели
+            week_type = get_week_type()
+            
+            # Получаем расписание на всю неделю
+            cursor.execute('''
+                SELECT * FROM raspisanie 
+                WHERE group_full_name=? AND subgroup=? AND week_type=?
+            ''', (group, subgroup, week_type))
+            schedule = cursor.fetchone()
+            
+            if not schedule:
+                await query.message.reply_text(
+                    "Расписание на неделю не найдено.",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« Назад", callback_data='schedule')]])
+                )
+                return
+                
+            # Форматируем расписание
+            week_type_text = "верхняя" if week_type == "UP" else "нижняя"
+            message = f"📅 Расписание на неделю ({week_type_text})\n"
+            message += f"Группа: {group}, Подгруппа: {subgroup}\n\n"
+            
+            days = ['Понедельник', 'Вторник', 'Среда', 'Четверг', 'Пятница', 'Суббота']
+            day_columns = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday']
+            
+            for day_name, day_col in zip(days, day_columns):
+                message += f"\n{day_name}:\n"
+                for i in range(1, 6):
+                    lesson = schedule[f"{day_col}_{i}"]
+                    if lesson and lesson.strip():
+                        message += f"{i}. {lesson}\n"
+            
+            # Разбиваем сообщение на части, если оно слишком длинное
+            if len(message) > 4096:
+                parts = [message[i:i+4096] for i in range(0, len(message), 4096)]
+                for part in parts[:-1]:
+                    await query.message.reply_text(part)
+                await query.message.reply_text(
+                    parts[-1],
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« Назад", callback_data='schedule')]])
+                )
+            else:
+                await query.message.reply_text(
+                    message,
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« Назад", callback_data='schedule')]])
+                )
+            
+        except Exception as e:
+            logger.error(f"Ошибка при получении расписания: {e}")
+            await query.message.reply_text(
+                "Произошла ошибка при получении расписания.",
+                reply_markup=REPLY_KEYBOARD_MARKUP
+            )
+        finally:
+            conn.close()
+        return
+
+    elif callback_data == 'edit_schedule':
+        if not is_admin:
+            await query.message.reply_text(
+                "У вас нет прав для редактирования расписания.",
+                reply_markup=REPLY_KEYBOARD_MARKUP
+            )
+            return
+            
+        keyboard = [
+            [InlineKeyboardButton("1️⃣ Подгруппа 1 (верхняя неделя)", callback_data='edit_schedule_1_UP')],
+            [InlineKeyboardButton("1️⃣ Подгруппа 1 (нижняя неделя)", callback_data='edit_schedule_1_DOWN')],
+            [InlineKeyboardButton("2️⃣ Подгруппа 2 (верхняя неделя)", callback_data='edit_schedule_2_UP')],
+            [InlineKeyboardButton("2️⃣ Подгруппа 2 (нижняя неделя)", callback_data='edit_schedule_2_DOWN')],
+            [InlineKeyboardButton("« Назад", callback_data='schedule')]
+        ]
+        
+        await query.message.reply_text(
+            "✏️ Редактирование расписания\n"
+            "Выберите подгруппу и тип недели для редактирования:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return
+
+    elif callback_data.startswith('edit_schedule_'):
+        if not is_admin:
+            await query.message.reply_text(
+                "У вас нет прав для редактирования расписания.",
+                reply_markup=REPLY_KEYBOARD_MARKUP
+            )
+            return
+
+        # Парсим параметры из callback_data (например: edit_schedule_1_UP)
+        parts = callback_data.split('_')
+        subgroup = parts[2]
+        week_type = parts[3]
+        logger.info(f"Редактирование расписания: подгруппа {subgroup}, тип недели {week_type}")
+        
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        try:
+            # Получаем группу администратора
+            cursor.execute('SELECT student_group FROM students WHERE telegram_id=?', (telegram_id,))
+            result = cursor.fetchone()
+            if not result:
+                await query.message.reply_text(
+                    "Ошибка: группа не найдена.",
+                    reply_markup=REPLY_KEYBOARD_MARKUP
+                )
+                return
+                
+            group = result[0]
+            group_full_name = f"{group}_sub{subgroup}_{week_type}"
+            logger.info(f"Получено group_full_name: {group_full_name}")
+            
+            # Получаем текущее расписание
+            cursor.execute('''
+                SELECT * FROM raspisanie 
+                WHERE group_full_name=?
+            ''', (group_full_name,))
+            schedule = cursor.fetchone()
+            logger.info(f"Найдено расписание: {bool(schedule)}")
+            
+            # Получаем имена колонок
+            cursor.execute('PRAGMA table_info(raspisanie)')
+            columns = {row[1]: idx for idx, row in enumerate(cursor.fetchall())}
+            logger.info(f"Получены колонки таблицы raspisanie: {list(columns.keys())}")
+            
+            # Создаем клавиатуру с кнопками для каждого дня и пары
+            keyboard = []
+            days = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday']
+            
+            for day in days:
+                day_buttons = []
+                for i in range(1, 6):
+                    field = f"{day}_{i}"
+                    button_text = field
+                    if schedule and field in columns:
+                        value = schedule[columns[field]]
+                        if value:
+                            try:
+                                data = json.loads(value)
+                                if data.get('type') == 'inactive':
+                                    button_text = "❌ Неактивно"
+                                elif data.get('type') == 'window':
+                                    button_text = "🪟 Форточка"
+                                else:
+                                    button_text = data.get('discipline', field)
+                            except json.JSONDecodeError:
+                                logger.error(f"Ошибка парсинга JSON для {field}: {value}")
+                                button_text = field
+                    
+                    day_buttons.append(InlineKeyboardButton(
+                        button_text, 
+                        callback_data=f'edit_slot_{subgroup}_{week_type}_{day}_{i}'
+                    ))
+                keyboard.append(day_buttons)
+            
+            keyboard.append([InlineKeyboardButton("« Назад", callback_data='edit_schedule')])
+            logger.info(f"Создана клавиатура с {len(keyboard)-1} строками по {len(keyboard[0])} кнопок")
+            
+            await query.message.reply_text(
+                f"📅 Редактирование расписания\n"
+                f"Подгруппа: {subgroup}\n"
+                f"Неделя: {'верхняя' if week_type == 'UP' else 'нижняя'}\n\n"
+                f"Выберите слот для редактирования:",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            
+        except Exception as e:
+            logger.error(f"Ошибка при отображении слотов расписания: {str(e)}\n{traceback.format_exc()}")
+            await query.message.reply_text(
+                "Произошла ошибка при отображении расписания.",
+                reply_markup=REPLY_KEYBOARD_MARKUP
+            )
+        finally:
+            conn.close()
+        return
+
+    elif callback_data.startswith('edit_slot_'):
+        if not is_admin:
+            await query.message.reply_text(
+                "У вас нет прав для редактирования расписания.",
+                reply_markup=REPLY_KEYBOARD_MARKUP
+            )
+            return
+            
+        # Парсим параметры (например: edit_slot_1_UP_monday_1)
+        try:
+            parts = callback_data.split('_')
+            subgroup = parts[2]
+            week_type = parts[3]
+            day = parts[4]
+            slot = parts[5]
+            logger.info(f"Редактирование слота: подгруппа {subgroup}, тип недели {week_type}, день {day}, слот {slot}")
+        except Exception as e:
+            logger.error(f"Ошибка при парсинге callback_data '{callback_data}': {str(e)}")
+            await query.message.reply_text(
+                "Произошла ошибка при обработке команды.",
+                reply_markup=REPLY_KEYBOARD_MARKUP
+            )
+            return
+        
+        keyboard = [
+            [InlineKeyboardButton("✏️ Задать пару", callback_data=f'set_lesson_{subgroup}_{week_type}_{day}_{slot}')],
+            [InlineKeyboardButton("🪟 Форточка", callback_data=f'set_window_{subgroup}_{week_type}_{day}_{slot}')],
+            [InlineKeyboardButton("❌ Сделать неактивной", callback_data=f'set_inactive_{subgroup}_{week_type}_{day}_{slot}')],
+            [InlineKeyboardButton("« Назад", callback_data=f'edit_schedule_{subgroup}_{week_type}')]
+        ]
+        
+        await query.message.reply_text(
+            f"Выберите действие для слота {day}_{slot}:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return
+
+    elif callback_data.startswith('set_lesson_'):
+        if not is_admin:
+            await query.message.reply_text(
+                "У вас нет прав для редактирования расписания.",
+                reply_markup=REPLY_KEYBOARD_MARKUP
+            )
+            return
+            
+        # Парсим параметры
+        try:
+            parts = callback_data.split('_')
+            subgroup = parts[2]
+            week_type = parts[3]
+            day = parts[4]
+            slot = parts[5]
+            logger.info(f"Выбор дисциплины для слота: подгруппа {subgroup}, тип недели {week_type}, день {day}, слот {slot}")
+        except Exception as e:
+            logger.error(f"Ошибка при парсинге callback_data '{callback_data}': {str(e)}")
+            await query.message.reply_text(
+                "Произошла ошибка при обработке команды.",
+                reply_markup=REPLY_KEYBOARD_MARKUP
+            )
+            return
+        
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        try:
+            # Получаем группу администратора
+            cursor.execute('SELECT student_group FROM students WHERE telegram_id=?', (telegram_id,))
+            result = cursor.fetchone()
+            if not result:
+                await query.message.reply_text(
+                    "Ошибка: группа не найдена.",
+                    reply_markup=REPLY_KEYBOARD_MARKUP
+                )
+                return
+                
+            group = result[0]
+            
+            # Получаем список активных дисциплин для группы
+            cursor.execute('SELECT * FROM disciplines WHERE group_name=?', (group,))
+            disciplines = cursor.fetchone()
+            
+            if not disciplines:
+                await query.message.reply_text(
+                    "Сначала необходимо задать список дисциплин для группы.",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("« Назад", callback_data=f'edit_slot_{subgroup}_{week_type}_{day}_{slot}')
+                    ]])
+                )
+                return
+            
+            # Получаем имена колонок
+            cursor.execute('PRAGMA table_info(disciplines)')
+            columns = {row[1]: idx for idx, row in enumerate(cursor.fetchall())}
+            
+            # Создаем клавиатуру с активными дисциплинами
+            keyboard = []
+            for i in range(1, 31):
+                disc_field = f'disc_{i}'
+                if disc_field in columns and disciplines[columns[disc_field]]:
+                    try:
+                        disc_data = json.loads(disciplines[columns[disc_field]])
+                        if not disc_data.get('inactive'):
+                            keyboard.append([InlineKeyboardButton(
+                                disc_data.get('discipline', 'Без названия'),
+                                callback_data=f'assign_lesson_{subgroup}_{week_type}_{day}_{slot}_{i}'
+                            )])
+                    except json.JSONDecodeError:
+                        continue
+            
+            keyboard.append([InlineKeyboardButton("« Назад", callback_data=f'edit_slot_{subgroup}_{week_type}_{day}_{slot}')])
+            
+            await query.message.reply_text(
+                "Выберите дисциплину для этого слота:",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            
+        except Exception as e:
+            logger.error(f"Ошибка при выборе дисциплины: {e}")
+            await query.message.reply_text(
+                "Произошла ошибка при выборе дисциплины.",
+                reply_markup=REPLY_KEYBOARD_MARKUP
+            )
+        finally:
+            conn.close()
+        return
+
+    elif callback_data.startswith('assign_lesson_'):
+        if not is_admin:
+            await query.message.reply_text(
+                "У вас нет прав для редактирования расписания.",
+                reply_markup=REPLY_KEYBOARD_MARKUP
+            )
+            return
+            
+        # Парсим параметры
+        try:
+            parts = callback_data.split('_')
+            subgroup = parts[2]
+            week_type = parts[3]
+            day = parts[4]
+            slot = parts[5]
+            disc_num = parts[6]
+            logger.info(f"Назначение дисциплины {disc_num} для слота: подгруппа {subgroup}, тип недели {week_type}, день {day}, слот {slot}")
+        except Exception as e:
+            logger.error(f"Ошибка при парсинге callback_data '{callback_data}': {str(e)}")
+            await query.message.reply_text(
+                "Произошла ошибка при обработке команды.",
+                reply_markup=REPLY_KEYBOARD_MARKUP
+            )
+            return
+        
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        try:
+            # Получаем группу администратора
+            cursor.execute('SELECT student_group FROM students WHERE telegram_id=?', (telegram_id,))
+            result = cursor.fetchone()
+            if not result:
+                await query.message.reply_text(
+                    "Ошибка: группа не найдена.",
+                    reply_markup=REPLY_KEYBOARD_MARKUP
+                )
+                return
+                
+            group = result[0]
+            group_full_name = f"{group}_sub{subgroup}_{week_type}"
+            
+            # Получаем информацию о дисциплине
+            cursor.execute(f'SELECT disc_{disc_num} FROM disciplines WHERE group_name=?', (group,))
+            disc_data = cursor.fetchone()
+            if not disc_data or not disc_data[0]:
+                await query.message.reply_text(
+                    "Ошибка: дисциплина не найдена.",
+                    reply_markup=REPLY_KEYBOARD_MARKUP
+                )
+                return
+            
+            discipline_info = json.loads(disc_data[0])
+            
+            # Проверяем существование записи в расписании
+            cursor.execute('SELECT 1 FROM raspisanie WHERE group_full_name=?', (group_full_name,))
+            exists = cursor.fetchone()
+            
+            if exists:
+                # Обновляем существующую запись
+                cursor.execute(f'''
+                    UPDATE raspisanie 
+                    SET {day}_{slot}=? 
+                    WHERE group_full_name=?
+                ''', (json.dumps(discipline_info), group_full_name))
+            else:
+                # Создаем новую запись
+                cursor.execute(f'''
+                    INSERT INTO raspisanie (group_full_name, {day}_{slot})
+                    VALUES (?, ?)
+                ''', (group_full_name, json.dumps(discipline_info)))
+            
+            conn.commit()
+            
+            await query.message.reply_text(
+                "✅ Дисциплина успешно назначена",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("« Назад", callback_data=f'edit_schedule_{subgroup}_{week_type}')
+                ]])
+            )
+            
+        except Exception as e:
+            logger.error(f"Ошибка при назначении дисциплины: {e}")
+            await query.message.reply_text(
+                "Произошла ошибка при назначении дисциплины.",
+                reply_markup=REPLY_KEYBOARD_MARKUP
+            )
+        finally:
+            conn.close()
+        return
+
+    elif callback_data.startswith('set_window_') or callback_data.startswith('set_inactive_'):
+        if not is_admin:
+            await query.message.reply_text(
+                "У вас нет прав для редактирования расписания.",
+                reply_markup=REPLY_KEYBOARD_MARKUP
+            )
+            return
+            
+        # Парсим параметры
+        try:
+            parts = callback_data.split('_')
+            action = parts[1]  # window или inactive
+            subgroup = parts[2]
+            week_type = parts[3]
+            day = parts[4]
+            slot = parts[5]
+            logger.info(f"Установка статуса {action} для слота: подгруппа {subgroup}, тип недели {week_type}, день {day}, слот {slot}")
+        except Exception as e:
+            logger.error(f"Ошибка при парсинге callback_data '{callback_data}': {str(e)}")
+            await query.message.reply_text(
+                "Произошла ошибка при обработке команды.",
+                reply_markup=REPLY_KEYBOARD_MARKUP
+            )
+            return
+            
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        try:
+            # Получаем группу администратора
+            cursor.execute('SELECT student_group FROM students WHERE telegram_id=?', (telegram_id,))
+            result = cursor.fetchone()
+            if not result:
+                await query.message.reply_text(
+                    "Ошибка: группа не найдена.",
+                    reply_markup=REPLY_KEYBOARD_MARKUP
+                )
+                return
+                
+            group = result[0]
+            group_full_name = f"{group}_sub{subgroup}_{week_type}"
+            
+            # Подготавливаем данные в зависимости от действия
+            if action == 'window':
+                data = {
+                    'type': 'window',
+                    'description': 'Форточка (перерыв между парами)'
+                }
+                status_text = "форточкой (перерыв)"
+            else:  # inactive
+                data = {
+                    'type': 'inactive',
+                    'description': 'Неактивная пара (нет занятий)'
+                }
+                status_text = "неактивной (нет занятий)"
+            
+            # Проверяем существование записи в расписании
+            cursor.execute('SELECT 1 FROM raspisanie WHERE group_full_name=?', (group_full_name,))
+            exists = cursor.fetchone()
+            
+            if exists:
+                # Обновляем существующую запись
+                cursor.execute(f'''
+                    UPDATE raspisanie 
+                    SET {day}_{slot}=? 
+                    WHERE group_full_name=?
+                ''', (json.dumps(data), group_full_name))
+            else:
+                # Создаем новую запись
+                cursor.execute(f'''
+                    INSERT INTO raspisanie (group_full_name, {day}_{slot})
+                    VALUES (?, ?)
+                ''', (group_full_name, json.dumps(data)))
+            
+            conn.commit()
+            
+            await query.message.reply_text(
+                f"✅ Пара помечена как {status_text}",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("« Назад", callback_data=f'edit_schedule_{subgroup}_{week_type}')
+                ]])
+            )
+            
+        except Exception as e:
+            logger.error(f"Ошибка при изменении статуса пары: {e}")
+            await query.message.reply_text(
+                "Произошла ошибка при изменении статуса пары.",
+                reply_markup=REPLY_KEYBOARD_MARKUP
+            )
+        finally:
+            conn.close()
+        return
+
+    elif callback_data == 'edit_disciplines':
+        if not is_admin:
+            await query.message.reply_text(
+                "У вас нет прав для редактирования дисциплин.",
+                reply_markup=REPLY_KEYBOARD_MARKUP
+            )
+            return
+            
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        try:
+            # Получаем группу администратора
+            cursor.execute('SELECT student_group FROM students WHERE telegram_id=?', (telegram_id,))
+            result = cursor.fetchone()
+            if not result:
+                await query.message.reply_text(
+                    "Ошибка: группа не найдена.",
+                    reply_markup=REPLY_KEYBOARD_MARKUP
+                )
+                return
+                
+            group = result[0]
+            
+            # Получаем список дисциплин для группы
+            cursor.execute('SELECT discipline_name, short_name FROM disciplines WHERE group_full_name=?', (group,))
+            disciplines = cursor.fetchall()
+            
+            keyboard = []
+            for discipline, short_name in disciplines:
+                display_name = f"{discipline} ({short_name})" if short_name else discipline
+                keyboard.append([InlineKeyboardButton(display_name, callback_data=f'edit_discipline_{discipline}')])
+            
+            keyboard.append([InlineKeyboardButton("➕ Добавить дисциплину", callback_data='add_discipline')])
+            keyboard.append([InlineKeyboardButton("« Назад", callback_data='edit_schedule')])
+            
+            await query.message.reply_text(
+                "📚 Список дисциплин\n"
+                "Выберите дисциплину для редактирования или добавьте новую:",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+        except Exception as e:
+            logger.error(f"Ошибка при получении списка дисциплин: {e}")
+            await query.message.reply_text(
+                "Произошла ошибка при получении списка дисциплин.",
+                reply_markup=REPLY_KEYBOARD_MARKUP
+            )
+        finally:
+            conn.close()
         return
 
     elif callback_data == 'profile_info':
@@ -1817,3 +2875,157 @@ async def handle_inline_buttons(update, context):
         finally:
             conn.close()
         return
+
+    # Обработка команды установки типа недели
+    if text.startswith('/set_week_type'):
+        await update.message.reply_text(
+            "Эта команда больше не поддерживается. Тип недели устанавливается в коде бота.",
+            reply_markup=REPLY_KEYBOARD_MARKUP
+        )
+        return
+
+    elif callback_data == 'set_week_type':
+        if not is_superadmin:
+            await query.message.reply_text(
+                "У вас нет прав для выполнения этого действия.",
+                reply_markup=REPLY_KEYBOARD_MARKUP
+            )
+            return
+            
+        # Получаем текущие настройки из базы данных
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT value FROM bot_settings WHERE key=?', ('week_type',))
+            result = cursor.fetchone()
+            settings = json.loads(result[0]) if result else {'current_type': 'UP', 'auto_switch': True}
+            
+        current_type = settings['current_type']
+        auto_switch = settings.get('auto_switch', True)
+        last_change = settings.get('last_change', 'Неизвестно')
+        
+        keyboard = [
+            [
+                InlineKeyboardButton("⬆️ Задать верхнюю", callback_data='set_week_up'),
+                InlineKeyboardButton("⬇️ Задать нижнюю", callback_data='set_week_down')
+            ],
+            [InlineKeyboardButton("« Назад", callback_data='settings')]
+        ]
+        
+        await query.message.reply_text(
+            f"📅 Управление типом недели\n\n"
+            f"Текущий тип: {'Верхняя' if current_type == 'UP' else 'Нижняя'}\n"
+            f"Авто-переключение: {'Включено' if auto_switch else 'Выключено'}\n"
+            f"Последнее изменение: {last_change}",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return
+        
+    elif callback_data in ['set_week_up', 'set_week_down']:
+        if not is_superadmin:
+            await query.message.reply_text(
+                "У вас нет прав для выполнения этого действия.",
+                reply_markup=REPLY_KEYBOARD_MARKUP
+            )
+            return
+            
+        new_type = 'UP' if callback_data == 'set_week_up' else 'DOWN'
+        set_week_type_settings(new_type=new_type)
+        
+        keyboard = [
+            [
+                InlineKeyboardButton("⬆️ Задать верхнюю", callback_data='set_week_up'),
+                InlineKeyboardButton("⬇️ Задать нижнюю", callback_data='set_week_down')
+            ],
+            [InlineKeyboardButton("« Назад", callback_data='settings')]
+        ]
+        
+        await query.message.reply_text(
+            f"✅ Тип недели успешно изменен!\n\n"
+            f"Текущий тип недели: {'Верхняя' if new_type == 'UP' else 'Нижняя'}",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return
+
+@handle_telegram_timeout()
+async def settings_menu(update, context):
+    """Показывает меню настроек для суперадмина"""
+    if not is_superadmin(update.effective_user.id):
+        await update.message.reply_text("У вас нет доступа к этому разделу.")
+        return
+
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT value FROM bot_settings WHERE key=?', ('week_type',))
+        result = cursor.fetchone()
+        settings = json.loads(result[0]) if result else {'current_type': 'UP', 'auto_switch': True}
+
+    current_type = settings['current_type']
+    auto_switch = settings.get('auto_switch', True)
+
+    keyboard = [
+        [
+            InlineKeyboardButton("📅 Тип недели: " + ("Верхняя" if current_type == 'UP' else "Нижняя"), 
+                               callback_data='toggle_week_type')
+        ],
+        [
+            InlineKeyboardButton("🔄 Авто-переключение: " + ("Вкл." if auto_switch else "Выкл."), 
+                               callback_data='toggle_auto_switch')
+        ]
+    ]
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text(
+        "⚙️ Настройки типа недели:\n\n"
+        f"Текущий тип: {'Верхняя' if current_type == 'UP' else 'Нижняя'}\n"
+        f"Авто-переключение: {'Включено' if auto_switch else 'Выключено'}",
+        reply_markup=reply_markup
+    )
+
+@handle_telegram_timeout()
+async def handle_settings_callback(update, context):
+    """Обрабатывает нажатия на кнопки в меню настроек"""
+    query = update.callback_query
+    await query.answer()
+
+    if not is_superadmin(query.from_user.id):
+        await query.message.reply_text("У вас нет доступа к этому действию.")
+        return
+
+    if query.data == 'toggle_week_type':
+        current_settings = set_week_type_settings(
+            new_type='DOWN' if get_week_type() == 'UP' else 'UP'
+        )
+        new_type = current_settings['current_type']
+        auto_switch = current_settings['auto_switch']
+
+    elif query.data == 'toggle_auto_switch':
+        current_settings = set_week_type_settings(
+            auto_switch=not json.loads(
+                get_db_connection().execute(
+                    'SELECT value FROM bot_settings WHERE key=?', 
+                    ('week_type',)
+                ).fetchone()[0]
+            )['auto_switch']
+        )
+        new_type = current_settings['current_type']
+        auto_switch = current_settings['auto_switch']
+
+    # Обновляем клавиатуру
+    keyboard = [
+        [
+            InlineKeyboardButton("📅 Тип недели: " + ("Верхняя" if new_type == 'UP' else "Нижняя"), 
+                               callback_data='toggle_week_type')
+        ],
+        [
+            InlineKeyboardButton("🔄 Авто-переключение: " + ("Вкл." if auto_switch else "Выкл."), 
+                               callback_data='toggle_auto_switch')
+        ]
+    ]
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await query.message.edit_text(
+        "⚙️ Настройки типа недели:\n\n"
+        f"Текущий тип: {'Верхняя' if new_type == 'UP' else 'Нижняя'}\n"
+        f"Авто-переключение: {'Включено' if auto_switch else 'Выключено'}",
+        reply_markup=reply_markup
+    )
