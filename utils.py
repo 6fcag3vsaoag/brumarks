@@ -38,6 +38,25 @@ with open('config.json') as config_file:
 # Global week type
 WEEK_TYPE = "UP"  # Может быть "UP" или "DOWN"
 
+async def notify_superadmins(application, text):
+    """
+    Отправить сообщение всем суперадминам (is_superadmin=1) через application.bot.send_message
+    """
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT telegram_id FROM students WHERE is_superadmin=1')
+            rows = cursor.fetchall()
+        for row in rows:
+            telegram_id = row[0]
+            if telegram_id:
+                try:
+                    await application.bot.send_message(chat_id=telegram_id, text=text)
+                except Exception as e:
+                    logger.error(f"Ошибка при отправке уведомления суперадмину {telegram_id}: {e}")
+    except Exception as e:
+        logger.error(f"Ошибка при рассылке суперадминам: {e}")
+
 def get_week_type():
     """Возвращает текущий тип недели и при необходимости автоматически переключает его"""
     with get_db_connection() as conn:
