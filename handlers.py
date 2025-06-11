@@ -16,11 +16,127 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMa
 from archive_manager import CourseWorkArchiveManager
 from datetime import datetime, timedelta
 
+# --- ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ ДЛЯ КЛАВИАТУРЫ РАСПИСАНИЯ ---
+def build_schedule_keyboard(schedule, group, subgroup, week_type, day_type, date_obj=None):
+    from telegram import InlineKeyboardButton
+    from datetime import datetime
+    lessons_data = []
+    lesson_buttons = []
+    inactive_count = 0
+    if not date_obj:
+        date_obj = datetime.now()
+    week_type_text = "верхняя" if week_type == "UP" else "нижняя"
+    if day_type == 'today':
+        message = f"\U0001F4C5 Расписание на сегодня ({date_obj.strftime('%d.%m.%Y')})\n"
+    else:
+        message = f"\U0001F4C5 Расписание на завтра ({date_obj.strftime('%d.%m.%Y')})\n"
+    message += f"Группа: {group}, Подгруппа: {subgroup}\n"
+    message += f"Неделя: {week_type_text}\n\n"
+    for i, lesson in enumerate(schedule, 1):
+        if lesson and lesson.strip():
+            try:
+                data = json.loads(lesson)
+                data['number'] = i
+                lessons_data.append(data)
+                if data.get('type') == 'inactive':
+                    inactive_count += 1
+                elif data.get('type') == 'window':
+                    lesson_buttons.append([InlineKeyboardButton(f"{i}. 🪟 Форточка", callback_data=f'lessoninfo_window_{day_type}_{i}')])
+                else:
+                    discipline = data.get('discipline', data.get('description', 'Пара'))
+                    auditory = data.get('auditory', '')
+                    btn_text = f"{i}. {discipline}"
+                    if auditory:
+                        btn_text += f" ({auditory})"
+                    lesson_buttons.append([InlineKeyboardButton(btn_text, callback_data=f'lessoninfo_{day_type}_{i}')])
+            except Exception:
+                lesson_buttons.append([InlineKeyboardButton(f"{i}. {lesson}", callback_data=f'lessoninfo_unknown_{day_type}_{i}')])
+        else:
+            inactive_count += 1
+    if inactive_count == 5:
+        message += "Выходной\n"
+        lesson_buttons = []
+    else:
+        lesson_buttons.append([InlineKeyboardButton("« Назад", callback_data='schedule')])
+    return message, lesson_buttons, lessons_data
+
 @handle_telegram_timeout()
 async def handle_message(update, context):
     text = update.message.text.strip()
     user_id = update.effective_user.id
     logger.info(f"Получено сообщение от пользователя {user_id}: {text}")
+
+    if context.user_data.get('awaiting_admin_comment'):
+        comment = text.strip()
+        params = context.user_data.get('edit_comment')
+        if not params:
+            await update.message.reply_text(
+                "Ошибка: параметры для комментария не найдены.",
+                reply_markup=REPLY_KEYBOARD_MARKUP
+            )
+            context.user_data.pop('awaiting_admin_comment', None)
+            return
+        subgroup = params['subgroup']
+        week_type = params['week_type']
+        day = params['day']
+        slot = params['slot']
+        telegram_id = str(update.effective_user.id)
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute('SELECT student_group FROM students WHERE telegram_id=?', (telegram_id,))
+            result = cursor.fetchone()
+            if not result:
+                await update.message.reply_text(
+                    "Ошибка: группа не найдена.",
+                    reply_markup=REPLY_KEYBOARD_MARKUP
+                )
+                return
+            group = result[0]
+            group_full_name = f"{group}_sub{subgroup}_{week_type}"
+            field = f"{day}_{slot}"
+            safe_field = '"' + field.replace('"', '""') + '"'
+            cursor.execute(f'SELECT {safe_field} FROM raspisanie WHERE group_full_name=?', (group_full_name,))
+            row = cursor.fetchone()
+            if row and row[0]:
+                try:
+                    data = json.loads(row[0])
+                except Exception:
+                    data = {}
+            else:
+                data = {}
+            data['admin_comment'] = comment
+            cursor.execute(f'UPDATE raspisanie SET {safe_field}=? WHERE group_full_name=?', (json.dumps(data, ensure_ascii=False), group_full_name))
+            conn.commit()
+            await update.message.reply_text(
+                f"Комментарий успешно {'удален' if not comment else 'обновлен'}!",
+                reply_markup=None
+            )
+        except Exception as e:
+            logger.error(f"Ошибка при сохранении admin_comment: {e}")
+            await update.message.reply_text(
+                "Ошибка при сохранении комментария.",
+                reply_markup=REPLY_KEYBOARD_MARKUP
+            )
+        finally:
+            if 'conn' in locals():
+                conn.close()
+        # Очистить флаги
+        context.user_data.pop('awaiting_admin_comment', None)
+        context.user_data.pop('edit_comment', None)
+        # Вернуть к меню редактирования этого слота
+        # Эмулируем callback для edit_slot
+        class FakeCallbackQuery:
+            def __init__(self, user_id, message, subgroup, week_type, day, slot):
+                self.data = f'edit_slot_{subgroup}_{week_type}_{day}_{slot}'
+                self.message = update.message
+                self.from_user = update.effective_user
+            async def answer(self):
+                pass
+        fake_query = FakeCallbackQuery(user_id, update.message, subgroup, week_type, day, slot)
+        fake_update = type('FakeUpdate', (), {'callback_query': fake_query, 'effective_user': update.effective_user})()
+        await handle_inline_buttons(fake_update, context)
+        return
 
     if text == '🏠 Главное меню':
         logger.info(f"Нажата кнопка '🏠 Главное меню' пользователем {user_id}")
@@ -703,17 +819,7 @@ async def handle_message(update, context):
             
         elif step == 'auditory':
             editing_data['auditory'] = text
-            editing_data['step'] = 'admin_comment'
-            await update.message.reply_text(
-                "Введите комментарий для студентов (если нет, напишите 'нет'):",
-                reply_markup=CANCEL_KEYBOARD_MARKUP
-            )
-            return
-            
-        elif step == 'admin_comment':
-            editing_data['admin_comment'] = text if text.lower() != 'нет' else ''
-            
-            # Сохраняем данные в базу
+            # Сохраняем данные в базу сразу после аудитории
             conn = get_db_connection()
             cursor = conn.cursor()
             try:
@@ -726,17 +832,13 @@ async def handle_message(update, context):
                         reply_markup=REPLY_KEYBOARD_MARKUP
                     )
                     return
-                    
                 group = result[0]
-                
                 # Создаем JSON с данными дисциплины
                 discipline_data = {
                     'discipline': editing_data['discipline'],
                     'lector_name': editing_data['lector_name'],
-                    'auditory': editing_data['auditory'],
-                    'admin_comment': editing_data['admin_comment']
+                    'auditory': editing_data['auditory']
                 }
-                
                 # Обновляем данные в базе
                 cursor.execute(f'''
                     UPDATE disciplines 
@@ -744,16 +846,39 @@ async def handle_message(update, context):
                     WHERE group_name=?
                 ''', (json.dumps(discipline_data), group))
                 conn.commit()
-                
                 # Очищаем данные редактирования
                 context.user_data.pop('editing_discipline', None)
-                
-                keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("« Назад", callback_data='setup_disciplines')]])
+                # После сохранения сразу возвращаем к настройке списка дисциплин
+                # (имитируем нажатие кнопки 'Назад')
+                keyboard = []
+                cursor.execute('SELECT * FROM disciplines WHERE group_name=?', (group,))
+                disciplines = cursor.fetchone()
+                cursor.execute('PRAGMA table_info(disciplines)')
+                columns = {row[1]: idx for idx, row in enumerate(cursor.fetchall())}
+                if disciplines:
+                    for i in range(1, 31):
+                        disc_field = f'disc_{i}'
+                        disc_data = disciplines[columns[disc_field]] if disc_field in columns else None
+                        if disc_data:
+                            try:
+                                disc_info = json.loads(disc_data)
+                                if disc_info.get('inactive'):
+                                    button_text = f"{i}. inactive"
+                                else:
+                                    button_text = f"{i}. {disc_info.get('discipline', 'Не задано')}"
+                            except json.JSONDecodeError:
+                                button_text = f"{i}. Ошибка данных"
+                        else:
+                            button_text = f"{i}. Не задано"
+                        keyboard.append([InlineKeyboardButton(button_text, callback_data=f'edit_disc_{i}')])
+                else:
+                    for i in range(1, 31):
+                        keyboard.append([InlineKeyboardButton(f"{i}. Не задано", callback_data=f'edit_disc_{i}')])
+                keyboard.append([InlineKeyboardButton("« Назад", callback_data='schedule')])
                 await update.message.reply_text(
-                    "✅ Информация о дисциплине успешно сохранена!",
-                    reply_markup=keyboard
+                    "✅ Информация о дисциплине успешно сохранена!\n\nВыберите номер дисциплины для редактирования:",
+                    reply_markup=InlineKeyboardMarkup(keyboard)
                 )
-                
             except Exception as e:
                 logger.error(f"Ошибка при сохранении информации о дисциплине: {e}")
                 await update.message.reply_text(
@@ -1324,6 +1449,7 @@ async def handle_inline_buttons(update, context):
         keyboard.append([InlineKeyboardButton("ℹ️ Информация о профиле", callback_data='profile_info')])
         keyboard.append([InlineKeyboardButton("🔔 Настройка уведомлений", callback_data='notifications_menu')])
         keyboard.append([InlineKeyboardButton("🏪 Black Market", callback_data='black_market')])
+        keyboard.append([InlineKeyboardButton("Установить подгруппу", callback_data='set_subgroup')])
         
         if is_admin:
             keyboard.append([InlineKeyboardButton("👥 Добавить админа", callback_data='add_admin')])
@@ -1339,6 +1465,39 @@ async def handle_inline_buttons(update, context):
             "Выберите нужный пункт меню:",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
+        return
+
+    elif callback_data == 'set_subgroup':
+        # Клавиатура выбора подгруппы
+        subgroup_keyboard = [
+            [InlineKeyboardButton("Подгруппа 1", callback_data='choose_subgroup_1')],
+            [InlineKeyboardButton("Подгруппа 2", callback_data='choose_subgroup_2')],
+            [InlineKeyboardButton("« Назад", callback_data='settings')]
+        ]
+        await query.message.reply_text(
+            "Выберите вашу подгруппу:",
+            reply_markup=InlineKeyboardMarkup(subgroup_keyboard)
+        )
+        return
+
+    elif callback_data.startswith('choose_subgroup_'):
+        # Обработка выбора подгруппы
+        chosen = callback_data.split('_')[-1]
+        if chosen not in ('1', '2'):
+            await query.message.reply_text("Ошибка: некорректный выбор подгруппы.")
+            return
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute('UPDATE students SET subgroup=? WHERE telegram_id=?', (chosen, telegram_id))
+            conn.commit()
+        except Exception as e:
+            logger.error(f"Ошибка при обновлении подгруппы: {e}")
+            await query.message.reply_text("Ошибка при сохранении подгруппы. Попробуйте позже.")
+            return
+        finally:
+            conn.close()
+        await query.message.reply_text(f"Ваша подгруппа успешно установлена: {chosen}")
         return
 
     elif callback_data == 'schedule':
@@ -1547,11 +1706,12 @@ async def handle_inline_buttons(update, context):
             week_type = get_week_type()
             
             # Получаем расписание
+            group_full_name = f"{group}_sub{subgroup}_{week_type}"
             cursor.execute(f'''
                 SELECT {weekday}_1, {weekday}_2, {weekday}_3, {weekday}_4, {weekday}_5
                 FROM raspisanie 
-                WHERE group_full_name=? AND subgroup=? AND week_type=?
-            ''', (group, subgroup, week_type))
+                WHERE group_full_name=?
+            ''', (group_full_name,))
             schedule = cursor.fetchone()
             
             if not schedule:
@@ -1561,20 +1721,18 @@ async def handle_inline_buttons(update, context):
                 )
                 return
                 
-            # Форматируем расписание
-            week_type_text = "верхняя" if week_type == "UP" else "нижняя"
-            message = f"📅 Расписание на сегодня ({datetime.now().strftime('%d.%m.%Y')})\n"
-            message += f"Группа: {group}, Подгруппа: {subgroup}\n"
-            message += f"Неделя: {week_type_text}\n\n"
-            
-            for i, lesson in enumerate(schedule, 1):
-                if lesson and lesson.strip():
-                    message += f"{i}. {lesson}\n"
-            
-            await query.message.reply_text(
-                message,
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« Назад", callback_data='schedule')]])
-            )
+            message, lesson_buttons, lessons_data = build_schedule_keyboard(schedule, group, subgroup, week_type, 'today')
+            if lesson_buttons:
+                await query.message.reply_text(
+                    message,
+                    reply_markup=InlineKeyboardMarkup(lesson_buttons)
+                )
+            else:
+                await query.message.reply_text(
+                    message,
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« Назад", callback_data='schedule')]])
+                )
+            context.user_data['lessons_today'] = lessons_data
             
         except Exception as e:
             logger.error(f"Ошибка при получении расписания: {e}")
@@ -1600,51 +1758,58 @@ async def handle_inline_buttons(update, context):
                     reply_markup=REPLY_KEYBOARD_MARKUP
                 )
                 return
-                
+
             group, subgroup = result
             if not subgroup:
                 subgroup = 1  # По умолчанию первая подгруппа
-                
-            # Определяем завтрашний день недели
-            tomorrow = datetime.now() + timedelta(days=1)
-            weekday = tomorrow.strftime('%A').lower()
-            
-            # Получаем тип недели
-            week_type = get_week_type()
-            # Если сегодня воскресенье, меняем тип недели на противоположный
-            if datetime.now().strftime('%A').lower() == 'sunday':
+
+            now = datetime.now()
+            today_weekday = now.strftime('%A').lower()
+            tomorrow = now + timedelta(days=1)
+
+            # Если сегодня воскресенье, показать расписание на понедельник противоположной недели
+            if today_weekday == 'sunday':
+                weekday = 'monday'
+                week_type = get_week_type()
+                # Переключаем на противоположный тип недели
                 week_type = "DOWN" if week_type == "UP" else "UP"
-            
-            # Получаем расписание
+                # Для корректного отображения даты передаем дату следующего понедельника
+                days_until_monday = (7 - now.weekday()) % 7 or 7
+                next_monday = now + timedelta(days=days_until_monday)
+                date_obj = next_monday
+            else:
+                weekday = tomorrow.strftime('%A').lower()
+                week_type = get_week_type()
+                date_obj = tomorrow
+
+            group_full_name = f"{group}_sub{subgroup}_{week_type}"
             cursor.execute(f'''
                 SELECT {weekday}_1, {weekday}_2, {weekday}_3, {weekday}_4, {weekday}_5
                 FROM raspisanie 
-                WHERE group_full_name=? AND subgroup=? AND week_type=?
-            ''', (group, subgroup, week_type))
+                WHERE group_full_name=?
+            ''', (group_full_name,))
             schedule = cursor.fetchone()
-            
+
             if not schedule:
                 await query.message.reply_text(
                     "Расписание на завтра не найдено.",
                     reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« Назад", callback_data='schedule')]])
                 )
                 return
-                
-            # Форматируем расписание
-            week_type_text = "верхняя" if week_type == "UP" else "нижняя"
-            message = f"📅 Расписание на завтра ({tomorrow.strftime('%d.%m.%Y')})\n"
-            message += f"Группа: {group}, Подгруппа: {subgroup}\n"
-            message += f"Неделя: {week_type_text}\n\n"
-            
-            for i, lesson in enumerate(schedule, 1):
-                if lesson and lesson.strip():
-                    message += f"{i}. {lesson}\n"
-            
-            await query.message.reply_text(
-                message,
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« Назад", callback_data='schedule')]])
-            )
-            
+
+            message, lesson_buttons, lessons_data = build_schedule_keyboard(schedule, group, subgroup, week_type, 'tomorrow', date_obj=date_obj)
+            if lesson_buttons:
+                await query.message.reply_text(
+                    message,
+                    reply_markup=InlineKeyboardMarkup(lesson_buttons)
+                )
+            else:
+                await query.message.reply_text(
+                    message,
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« Назад", callback_data='schedule')]])
+                )
+            context.user_data['lessons_tomorrow'] = lessons_data
+
         except Exception as e:
             logger.error(f"Ошибка при получении расписания: {e}")
             await query.message.reply_text(
@@ -1655,6 +1820,38 @@ async def handle_inline_buttons(update, context):
             conn.close()
         return
 
+    elif callback_data.startswith('lessoninfo_today_') or callback_data.startswith('lessoninfo_window_today_'):
+        num = int(callback_data.rsplit('_', 1)[-1])
+        lessons = context.user_data.get('lessons_today', [])
+        if callback_data.startswith('lessoninfo_window_today_'):
+            await query.message.reply_text("Форточка это промежуток между парами. Используй его с пользой. Посиди отдохни, подумай как ты докатился до такой жизни.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« Назад", callback_data='schedule_today')]]))
+        elif 0 < num <= len(lessons):
+            data = lessons[num-1]
+            discipline = data.get('discipline', data.get('description', 'Пара'))
+            auditory = data.get('auditory', '—')
+            lecturer = data.get('lector_name') or data.get('lecturer', '—')
+            comment = data.get('admin_comment') if 'admin_comment' in data else data.get('comment', '')
+            msg = f"<b>{discipline}</b>\nАудитория: {auditory}\nПреподаватель: {lecturer}"
+            if comment:
+                msg += f"\nКомментарий: {comment}"
+            await query.message.reply_text(msg, parse_mode='HTML', reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« Назад", callback_data='schedule_today')]]))
+        return
+    elif callback_data.startswith('lessoninfo_tomorrow_') or callback_data.startswith('lessoninfo_window_tomorrow_'):
+        num = int(callback_data.rsplit('_', 1)[-1])
+        lessons = context.user_data.get('lessons_tomorrow', [])
+        if callback_data.startswith('lessoninfo_window_tomorrow_'):
+            await query.message.reply_text("Форточка это промежуток между парами. Используй его с пользой. Посиди отдохни, подумай как ты докатился до такой жизни.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« Назад", callback_data='schedule_tomorrow')]]))
+        elif 0 < num <= len(lessons):
+            data = lessons[num-1]
+            discipline = data.get('discipline', data.get('description', 'Пара'))
+            auditory = data.get('auditory', '—')
+            lecturer = data.get('lector_name') or data.get('lecturer', '—')
+            comment = data.get('admin_comment') if 'admin_comment' in data else data.get('comment', '')
+            msg = f"<b>{discipline}</b>\nАудитория: {auditory}\nПреподаватель: {lecturer}"
+            if comment:
+                msg += f"\nКомментарий: {comment}"
+            await query.message.reply_text(msg, parse_mode='HTML', reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« Назад", callback_data='schedule_tomorrow')]]))
+        return
     elif callback_data == 'schedule_week':
         # Получаем расписание на неделю
         conn = get_db_connection()
@@ -1678,10 +1875,11 @@ async def handle_inline_buttons(update, context):
             week_type = get_week_type()
             
             # Получаем расписание на всю неделю
+            group_full_name = f"{group}_sub{subgroup}_{week_type}"
             cursor.execute('''
                 SELECT * FROM raspisanie 
-                WHERE group_full_name=? AND subgroup=? AND week_type=?
-            ''', (group, subgroup, week_type))
+                WHERE group_full_name=?
+            ''', (group_full_name,))
             schedule = cursor.fetchone()
             
             if not schedule:
@@ -1696,16 +1894,37 @@ async def handle_inline_buttons(update, context):
             message = f"📅 Расписание на неделю ({week_type_text})\n"
             message += f"Группа: {group}, Подгруппа: {subgroup}\n\n"
             
-            days = ['Понедельник', 'Вторник', 'Среда', 'Четверг', 'Пятница', 'Суббота']
-            day_columns = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday']
-            
+            days = ['Понедельник', 'Вторник', 'Среда', 'Четверг', 'Пятница', 'Суббота', 'Воскресенье']
+            day_columns = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday']
+
+            columns = [desc[0] for desc in cursor.description]
+            schedule_dict = dict(zip(columns, schedule))
+
             for day_name, day_col in zip(days, day_columns):
-                message += f"\n{day_name}:\n"
+                lessons = []
+                active_lessons = []
+                inactive_count = 0
                 for i in range(1, 6):
-                    lesson = schedule[f"{day_col}_{i}"]
+                    lesson = schedule_dict.get(f"{day_col}_{i}")
                     if lesson and lesson.strip():
-                        message += f"{i}. {lesson}\n"
-            
+                        try:
+                            data = json.loads(lesson)
+                            if data.get('type') == 'inactive':
+                                inactive_count += 1
+                            elif data.get('type') == 'window':
+                                active_lessons.append(f"{i}. 🪟 Форточка")
+                            else:
+                                active_lessons.append(f"{i}. {data.get('discipline', data.get('description', 'Пара'))}")
+                        except Exception:
+                            active_lessons.append(f"{i}. {lesson}")
+                    else:
+                        inactive_count += 1
+                message += f"\n{day_name}:\n"
+                if inactive_count == 5:
+                    message += "Выходной\n"
+                else:
+                    message += "\n".join(active_lessons) + "\n"
+
             # Разбиваем сообщение на части, если оно слишком длинное
             if len(message) > 4096:
                 parts = [message[i:i+4096] for i in range(0, len(message), 4096)]
@@ -1877,6 +2096,7 @@ async def handle_inline_buttons(update, context):
             [InlineKeyboardButton("✏️ Задать пару", callback_data=f'set_lesson_{subgroup}_{week_type}_{day}_{slot}')],
             [InlineKeyboardButton("🪟 Форточка", callback_data=f'set_window_{subgroup}_{week_type}_{day}_{slot}')],
             [InlineKeyboardButton("❌ Сделать неактивной", callback_data=f'set_inactive_{subgroup}_{week_type}_{day}_{slot}')],
+            [InlineKeyboardButton("💬 Добавить комментарий", callback_data=f'set_comment_{subgroup}_{week_type}_{day}_{slot}')],
             [InlineKeyboardButton("« Назад", callback_data=f'edit_schedule_{subgroup}_{week_type}')]
         ]
         
@@ -1886,6 +2106,37 @@ async def handle_inline_buttons(update, context):
         )
         return
 
+    elif callback_data.startswith('set_comment_'):
+        if not is_admin:
+            await query.message.reply_text(
+                "У вас нет прав для редактирования расписания.",
+                reply_markup=REPLY_KEYBOARD_MARKUP
+            )
+            return
+        try:
+            parts = callback_data.split('_')
+            subgroup = parts[2]
+            week_type = parts[3]
+            day = parts[4]
+            slot = parts[5]
+            context.user_data['edit_comment'] = {
+                'subgroup': subgroup,
+                'week_type': week_type,
+                'day': day,
+                'slot': slot
+            }
+            await query.message.reply_text(
+                f"Введите комментарий для {day}_{slot} (или отправьте пустое сообщение, чтобы удалить комментарий):",
+                reply_markup=None
+            )
+            context.user_data['awaiting_admin_comment'] = True
+        except Exception as e:
+            logger.error(f"Ошибка при начале ввода комментария: {e}")
+            await query.message.reply_text(
+                "Произошла ошибка при попытке добавить комментарий.",
+                reply_markup=REPLY_KEYBOARD_MARKUP
+            )
+        return
     elif callback_data.startswith('set_lesson_'):
         if not is_admin:
             await query.message.reply_text(
@@ -2874,14 +3125,6 @@ async def handle_inline_buttons(update, context):
             await query.message.reply_text("Произошла ошибка при получении данных.\n\nВы можете вернуться в главное меню командой /cancel.")
         finally:
             conn.close()
-        return
-
-    # Обработка команды установки типа недели
-    if text.startswith('/set_week_type'):
-        await update.message.reply_text(
-            "Эта команда больше не поддерживается. Тип недели устанавливается в коде бота.",
-            reply_markup=REPLY_KEYBOARD_MARKUP
-        )
         return
 
     elif callback_data == 'set_week_type':

@@ -13,11 +13,12 @@ class StudentParserScheduler:
         self.archive_manager = CourseWorkArchiveManager()
 
     async def start(self):
-        """Запускает планировщик парсинга"""
+        """Запускает планировщик парсинга и авто-смену недели"""
         if not self.is_running:
             self.is_running = True
             self.parser_task = asyncio.create_task(self._parser_worker())
             asyncio.create_task(self._schedule_parser())
+            asyncio.create_task(self._auto_switch_week_type())
 
     async def stop(self):
         """Останавливает планировщик парсинга"""
@@ -103,6 +104,29 @@ class StudentParserScheduler:
             except Exception as e:
                 logger.error(f"Ошибка в планировщике парсинга: {e}")
                 await asyncio.sleep(60)  # Ждем минуту перед повторной попыткой
+
+    async def _auto_switch_week_type(self):
+        """Автоматически переключает тип недели каждую неделю в понедельник в 00:00"""
+        while self.is_running:
+            now = datetime.datetime.now()
+            # Найти следующее наступление понедельника 00:00
+            next_monday = now + datetime.timedelta(days=(7 - now.weekday()) % 7)
+            next_switch = next_monday.replace(hour=0, minute=0, second=0, microsecond=0)
+            if next_switch <= now:
+                next_switch += datetime.timedelta(days=7)
+            wait_seconds = (next_switch - now).total_seconds()
+            logger.info(f"Следующее авто-переключение недели запланировано на {next_switch} (через {wait_seconds} сек)")
+            await asyncio.sleep(wait_seconds)
+            # Переключить тип недели
+            try:
+                current_type = get_week_type()
+                new_type = 'DOWN' if current_type == 'UP' else 'UP'
+                set_week_type_settings(new_type=new_type)
+                logger.info(f"Тип недели автоматически переключён на {new_type} ({'верхняя' if new_type == 'UP' else 'нижняя'})")
+            except Exception as e:
+                logger.error(f"Ошибка при авто-переключении типа недели: {e}")
+            # Ждать ещё неделю до следующего переключения
+            await asyncio.sleep(7 * 24 * 60 * 60)
 
     def _is_system_telegram_id(self, telegram_id):
         """Проверяет, является ли telegram_id системным (добавлен админом или суперадмином)"""
